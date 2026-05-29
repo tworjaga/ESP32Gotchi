@@ -19,28 +19,75 @@ The firmware uses FreeRTOS with four independent tasks, a promiscuous-mode Wi-Fi
 
 ---
 
-## v1.1.0 — What Changed
+## v1.2.1 — Correctness & Safety Audit + RSSI Filtering
 
-### Hardware (one wire change required)
+This release combines a full correctness and safety audit (v1.2.0) with one targeted feature addition (v1.2.1). The audit identified and resolved thirteen issues across four severity tiers — ranging from a deadlock-class mutex misuse to silent partial writes and cross-core memory visibility violations. The new feature implements threshold-based RSSI filtering directly inside the promiscuous callback, eliminating weak-signal packets before they consume any static pool resources.
+
+**Hardware: no changes from v1.1.0. No pin changes. No BOM changes. Flash the new `.ino`, nothing else required.**
+
+### Fixes Applied (v1.2.0)
+
+| Fix | Description |
+|-----|-------------|
+| F1 | `chunk_buf` size derived from `MAX_PKT_LEN` via named constant `CHUNK_BUF_SIZE`; `static_assert` + runtime `configASSERT` bounds checks added |
+| F2 | `g_ap_table` hash table now protected by `portMUX_TYPE` spinlock; ISR-safe critical section wraps the entire probe loop |
+| F3 | `pcap_write()` slot release uses `portMAX_DELAY` instead of 20 ms timeout; slot always cleared, no silent leak |
+| F4 | `configASSERT(xPortGetCoreID() == 1)` added as first statement in `task_ui`; core-isolation enforced rather than implied |
+| F5 | `g_hs_mutex` converted to recursive mutex (`xSemaphoreCreateRecursiveMutex`); deadlock path via `hs_expire()` eliminated |
+| F6 | `g_channel`, `g_led`, `g_face`, `g_last_sd_retry` converted from `volatile` to `std::atomic<T>` with `.load()` / `.store()` |
+| F7 | `f.write()` return value now checked; partial writes logged and propagated as failure to OLED error state |
+| F8 | `mac_hash()` replaced djb2 with Murmur3 finaliser mix for uniform distribution over OUI-heavy captures |
+| F9 | `task_proc` and `task_write` stack sizes increased to 6 144 words; named `STACK_PROC` / `STACK_WRITE` constants in tuning block |
+| F10 | `btn_tick()` poll-rate dependency on `vTaskDelay` documented in comment |
+| F11 | `static_assert` guards added adjacent to `POOL_NONE` definition to prevent sentinel collision if pool depth approaches 255 |
+| F12 | `SPI.begin()` now called exactly once across retries via `static bool spi_started`; repeated calls on active bus eliminated |
+| F13 | WDT reset on SD write stall documented as intentional recovery mechanism |
+
+### Feature Added (v1.2.1)
+
+**RSSI threshold filter in `promisc_cb()`** — weak-signal packets are dropped before touching the static pool. The filter fires as the very first operation after the packet-type check, before any `memcpy` or pool slot claim. A rejected packet costs one signed comparison and one atomic increment.
+
+```c
+#define RSSI_THRESHOLD  (-80)   /* dBm — tune to environment */
+```
+
+Tune to your environment:
+
+| Threshold | Use case |
+|-----------|----------|
+| –70 dBm | Dense RF, many nearby APs |
+| –80 dBm | Default; good for typical indoor environments |
+| –85 dBm | Open air, long-range targets |
+
+Two new atomics (`g_last_rssi`, `g_rssi_drops`) are updated in the ISR and consumed by `task_ui` and `task_proc`. The OLED bottom line and serial log now show live RSSI and drop telemetry:
+
+```
+RSSI:-67 D:142
+[STAT] pkt/s=23  rssi=-67dBm  drops=142  thr=-80dBm
+```
+
+---
+
+## v1.1.0 — Previous Release Summary
+
+### Hardware (one wire change required from v1.0.0)
 
 **The button must be moved from GPIO0 to GPIO4.**
 
-GPIO0 is the ESP32 boot-mode strapping pin. The ROM samples it approximately 50 ms after every reset to decide whether to start the user firmware or enter serial Download Mode. The v1.0.0 wiring placed the user button on this pin. Although the restart fires on button *release* (so typical use is fine), a user who keeps the button pressed while the device reboots will land in Download Mode with a black screen that looks like a brick.
+GPIO0 is the ESP32 boot-mode strapping pin. A user who keeps the button pressed while the device reboots will land in Download Mode. GPIO4 has no strapping function. Move the single button wire from DevKit pin `IO0` to `IO4`. No other hardware changes.
 
-GPIO4 has no strapping function. Move the single button wire from DevKit pin `IO0` to `IO4`. No other hardware changes.
-
-### Firmware — eight fixes applied
+### Firmware Fixes in v1.1.0
 
 | Fix | Description |
 |-----|-------------|
 | FIX-1 | Button pin: `GPIO0` → `GPIO4` (strapping-pin hazard) |
-| FIX-2 | Task priorities rebalanced: `task_hop` raised to 6 (was 3), `task_write` raised to 4 (was 2). Channel hopping now guaranteed regardless of packet load. |
-| FIX-3 | Zero-allocation packet path: `promisc_cb` no longer calls `malloc()`/`free()`. A static pool of 32 fixed-size blocks is claimed/released via a FreeRTOS free-list queue. |
-| FIX-4 | `hs_slot_t` no longer embeds `raw[4][1600]` (was 6 430 bytes/slot, 205 KB for 32 slots). Raw frames are stored in a separate 32-block static pool; slots hold pool indices. |
-| FIX-5 | `write_item_t` is now `uint8_t` (slot index). The write queue allocates 8 bytes instead of 51 440 bytes. No bulk memcpy of frame data. |
-| FIX-6 | `g_ap_mutex` removed. `task_proc` is the only writer of the AP table; `task_ui` reads only `g_ap_count` (naturally atomic on Xtensa LX6). |
-| FIX-7 | O(N) AP linear scan replaced with a 256-bucket open-addressing hash table. AP lookup is O(1) average. |
-| FIX-8 | EAPOL slot-exhaustion DoS mitigated: new slot creation rate-limited to one per 100 ms. `MAX_HS_SLOTS` reduced to 16; `HS_EXPIRE_MS` reduced to 15 s. |
+| FIX-2 | Task priorities rebalanced: `task_hop` raised to 6, `task_write` raised to 4 |
+| FIX-3 | Zero-allocation packet path: `promisc_cb` uses a static pool of 32 fixed-size blocks |
+| FIX-4 | `hs_slot_t` no longer embeds raw frame data; slots hold pool indices instead |
+| FIX-5 | `write_item_t` is now `uint8_t` (slot index); write queue allocates 8 bytes instead of 51 440 bytes |
+| FIX-6 | `g_ap_mutex` removed; `g_ap_count` reads are naturally atomic on Xtensa LX6 |
+| FIX-7 | O(N) AP linear scan replaced with 256-bucket open-addressing hash table |
+| FIX-8 | EAPOL slot-exhaustion DoS mitigated: new slot creation rate-limited to 1 per 100 ms; `MAX_HS_SLOTS` reduced to 16; `HS_EXPIRE_MS` reduced to 15 s |
 
 ---
 
@@ -81,7 +128,7 @@ ESP32 GND     ->  GND
 
 > **GPIO5 note:** GPIO5 is the SDIO-slave timing strapping pin but has no effect in SPI mode. Safe on DevKit V1. On a custom PCB, do not place an external pull-up stronger than 10 kΩ on GPIO5 before the strapping window closes at boot.
 
-**Button — v1.1.0: GPIO4 (was GPIO0)**
+**Button — GPIO4 (changed from GPIO0 in v1.1.0)**
 ```
 ESP32 GPIO4   ->  Button  ->  GND
 (internal pull-up enabled in firmware)
@@ -113,7 +160,7 @@ LiPo 3.7V -> TP4056 -> ESP32 VIN
 ESP32-WROOM-32
  |-- OLED SSD1306      (I2C: GPIO21/22)
  |-- MicroSD module    (SPI: GPIO18/19/23/5)
- |-- Tactile button    (GPIO4, active-low)   ← v1.1.0: was GPIO0
+ |-- Tactile button    (GPIO4, active-low)
  |-- Status LED        (GPIO2, optional)
  |-- LiPo + TP4056     (optional, portable)
 ```
@@ -128,10 +175,10 @@ Four FreeRTOS tasks with explicit core pinning:
 
 | Task | Core | Priority | Stack | Function |
 |------|------|----------|-------|----------|
-| `task_hop` | 0 | **6** | 2 KB | Cycles channels 1–11, 200 ms dwell. Highest priority on Core 0 — guaranteed to run. |
-| `task_proc` | 0 | 5 | 4 KB | Pulls packets from queue, parses 802.11/EAPOL, manages handshake slots. |
-| `task_write` | 0 | **4** | 4 KB | Receives completed handshakes (by slot index), writes PCAP to SD. |
-| `task_ui` | 1 | 1 | 4 KB | Updates OLED every 200 ms, handles LED and button. |
+| `task_hop` | 0 | 6 | 2 KB | Cycles channels 1–11, 200 ms dwell |
+| `task_proc` | 0 | 5 | **6 KB** | Pulls packets from queue, parses 802.11/EAPOL, manages handshake slots |
+| `task_write` | 0 | 4 | **6 KB** | Receives completed handshakes by slot index, writes PCAP to SD |
+| `task_ui` | 1 | 1 | 4 KB | Updates OLED every 200 ms, handles LED and button |
 
 ### Memory Layout
 
@@ -139,9 +186,9 @@ All packet storage is statically allocated at boot. No `malloc()` or `free()` at
 
 | Region | Size | Purpose |
 |--------|------|---------|
-| `pkt_pool_mem[32][1600]` | 51 200 B | In-flight packet buffers (claimed by `promisc_cb`, released by `task_proc`) |
-| `hs_raw_pool_mem[32][1600]` | 51 200 B | Handshake frame storage (held until PCAP written, then released) |
-| `g_hs[16]` metadata | ~640 B | Handshake slot state (indices into `hs_raw_pool_mem`, not frame data) |
+| `pkt_pool_mem[32][1600]` | 51 200 B | In-flight packet buffers |
+| `hs_raw_pool_mem[32][1600]` | 51 200 B | Handshake frame storage |
+| `g_hs[16]` metadata | ~640 B | Handshake slot state (pool indices only) |
 | `g_ap_table[256][6]` | 1 536 B | AP hash table |
 | **Total user static** | **~104 KB** | Well within the ~200 KB available after the Wi-Fi stack |
 
@@ -157,6 +204,12 @@ Implements IEEE 802.11-2020 §12.7.2 key_info bit field:
 | Msg 4 | 1 | 0 | 1 | 0 | 1 |
 
 All four messages must be captured to mark a handshake as complete. Incomplete slots expire after 15 seconds.
+
+### RSSI Filtering
+
+The promiscuous callback drops packets below `RSSI_THRESHOLD` (default –80 dBm) before any pool resource is claimed. Signals weaker than this threshold cannot reliably complete the four-message EAPOL exchange and would consume pool slots that expire without producing a capture.
+
+The OLED and serial output report the last accepted RSSI and cumulative drop count in real time. If the drop counter grows significantly faster than `pkt/s`, the threshold is more aggressive than necessary for the current environment.
 
 ### PCAP Output
 
@@ -174,7 +227,7 @@ HS:  12        <- handshakes captured this session
 CH:  6         <- current Wi-Fi channel
 AP:  34        <- unique BSSIDs seen
 PKT: 128       <- packets processed per second
-SD:  OK        <- SD card status
+RSSI:-67 D:142 <- last accepted RSSI / cumulative dropped packets
 ```
 
 Face states:
@@ -190,7 +243,7 @@ Face states:
 | Slow blink (1 Hz) | Normal scanning |
 | Fast blink (5 Hz) | Handshake capture in progress |
 | Single short flash | Handshake saved to SD |
-| 3 x long flash (2 s) | SD error — repeating |
+| 3 × long flash (2 s) | SD error — repeating |
 
 ### Button Behaviour
 
@@ -246,8 +299,8 @@ board_build.partitions = default.csv
 - Format: FAT32
 - Minimum recommended size: 2 GB
 - The firmware creates `/handshakes/` automatically on first boot
-- Minimum free space check: 1 MB before each write. If space is below threshold, the device continues sniffing but skips saving.
-- If SD is absent or fails, the device retries initialisation every 10 seconds and displays `SD: ERR`.
+- Minimum free space check: 1 MB before each write; if below threshold the device continues sniffing but skips saving
+- If SD is absent or fails, the device retries initialisation every 10 seconds and displays `SD: ERR`
 
 ---
 
@@ -256,7 +309,7 @@ board_build.partitions = default.csv
 Connect at 115200 baud. Example output:
 
 ```
-[BOOT] ESP32 Cheapagotchi v1.1.0
+[BOOT] ESP32 Cheapagotchi v1.2.1
 [SD] OK
 [WIFI] promiscuous active
 [BOOT] tasks started
@@ -266,6 +319,7 @@ Connect at 115200 baud. Example output:
 [HS] aa:bb:cc:dd:ee:ff -> 11:22:33:44:55:66  msg3
 [HS] aa:bb:cc:dd:ee:ff -> 11:22:33:44:55:66  msg4
 [HS] saved /handshakes/hs_aa_bb_cc_dd_ee_ff_3721.pcap  total=1
+[STAT] pkt/s=23  rssi=-67dBm  drops=142  thr=-80dBm
 ```
 
 ---
@@ -292,9 +346,10 @@ ESP32Gotchi/
 | `SD: ERR` on boot | SD not inserted, wrong wiring, not FAT32 | Check SPI wiring, reformat to FAT32 |
 | OLED blank | I2C address mismatch or wiring fault | Verify SDA/SCL, confirm 0x3C with I2C scanner |
 | No handshakes captured | No WPA2 4-way exchanges occurring nearby | Use a test AP; deauth-based capture is outside scope of this firmware |
-| Device reboots repeatedly | Watchdog trigger — task hang | Check serial output for last log line; report via Issues |
+| Drop counter rising fast | RSSI_THRESHOLD too aggressive for environment | Lower threshold (e.g. –85 dBm) in tuning block and reflash |
+| Device reboots repeatedly | Watchdog trigger — task hang (note: WDT reset on SD stall is intentional) | Check serial output for last log line; report via Issues |
 | PCAP not opening in Wireshark | Corrupt write (power cut during save) | Delete partial file; ensure stable power supply |
-| Black screen after long-press restart (v1.0.0 only) | Button was on GPIO0 strapping pin | Upgrade to v1.1.0 and move button wire to GPIO4 |
+| Black screen after long-press restart (v1.0.0 only) | Button was on GPIO0 strapping pin | Upgrade to v1.1.0+ and move button wire to GPIO4 |
 
 ---
 
@@ -314,6 +369,7 @@ ESP32Gotchi/
 | Max tracked APs | 192 (hash table, 256 buckets) |
 | Handshake slot timeout | 15 s |
 | New slot rate limit | 1 per 100 ms |
+| RSSI threshold (default) | –80 dBm (configurable) |
 | PCAP network type | 105 (802.11 + radiotap) |
 | Watchdog timeout | 30 s |
 | Min SD free space | 1 MB |
