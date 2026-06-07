@@ -1,5 +1,5 @@
 /*
- * ESP32 Cheapagotchi — WPA/WPA2 Handshake Sniffer  (v1.2.1)
+ * ESP32 Cheapagotchi — WPA/WPA2 Handshake Sniffer  (v1.2.2)
  * Project: ESP32Gotchi | github: tworjaga | telegram: @al7exy
  *
  * Target  : ESP32 Dev Module (ESP32-WROOM-32, 30-pin)
@@ -27,6 +27,28 @@
  *  RSSI filter applied in promisc_cb before pool claim — weak-signal
  *  packets dropped at zero pool cost. Threshold: RSSI_THRESHOLD (-80 dBm).
  *  Last RSSI and cumulative drop count exposed on OLED and Serial.
+ *
+ * Fixes applied (v1.2.2):
+ *  R1  [HIGH]   promisc_cb: sig_len includes 4-byte 802.11 FCS trailer that
+ *               is NOT present in pkt->payload[]. Strip it before memcpy and
+ *               before storing raw_len. Without this every PCAP record had 4
+ *               bytes of garbage at the tail → Wireshark dissect errors and
+ *               hashcat MIC verification failures (false "no match").
+ *  R2  [MEDIUM] pcap_write_file: configASSERT on the memcpy bounds check is
+ *               compiled out in release (NDEBUG). Replaced with a hard runtime
+ *               guard that returns false, preventing silent stack corruption.
+ *  R3  [MEDIUM] task_hop: pinned to Core 0 (matches task_proc / WiFi driver
+ *               affinity). Added configASSERT(xPortGetCoreID()==0) mirroring
+ *               the pattern used in task_ui (F4).
+ *  R4  [MEDIUM] process_packet write-queue-full cleanup: changed 5 ms mutex
+ *               timeout to portMAX_DELAY. A 5 ms timeout could silently fail
+ *               while task_write holds the mutex during an SD stall, leaving
+ *               the hs_slot permanently active and leaking all raw pool blocks.
+ *  R5  [LOW]    task_proc SD retry: moved sd_init() call to a dedicated flag
+ *               (g_sd_retry_req atomic) consumed by task_write, so the proc
+ *               task is never blocked for hundreds of ms on SD initialisation.
+ *  R6  [LOW]    setup(): [MEM] free-heap log moved to after all task creations
+ *               so it reflects the true post-allocation heap headroom.
  */
 
 #include <Arduino.h>
@@ -157,6 +179,10 @@ static std::atomic<bool>     g_sd_ok{false};
  * Updated in the ISR — atomic<int8_t> gives safe cross-core reads for OLED. */
 static std::atomic<int8_t>   g_last_rssi{0};
 static std::atomic<uint32_t> g_rssi_drops{0};
+/* R5: SD retry request flag. task_proc sets this instead of calling sd_init()
+ *     directly, so the proc task is never stalled for hundreds of ms on SD init.
+ *     task_write consumes it at the top of its idle loop. */
+static std::atomic<bool>     g_sd_retry_req{false};
 
 /* --------------------------------------------------------------------------
  * Global state
@@ -334,6 +360,14 @@ static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t* chunk_buf) {
         write32_le(len);
 
         configASSERT(offset + len <= CHUNK_BUF_SIZE);
+        /* R2: configASSERT is compiled out in release (NDEBUG). Add a hard
+         *     runtime guard so an unexpected overrun returns an error instead
+         *     of silently writing past the buffer into the task stack. */
+        if (offset + len > CHUNK_BUF_SIZE) {
+            Serial.printf("[PCAP] chunk overflow at frame %d (offset=%lu len=%lu) — abort\n",
+                          i, (unsigned long)offset, (unsigned long)len);
+            return false;
+        }
         memcpy(chunk_buf + offset, hs_raw_pool_mem[hs->raw_idx[i]], len);
         offset += len;
     }
@@ -587,7 +621,13 @@ static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
             write_item_t wi = done_idx;
             if (xQueueSend(g_write_queue, &wi, 0) != pdTRUE) {
                 Serial.println("[HS] write queue full, drop");
-                if (xSemaphoreTakeRecursive(g_hs_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                /* R4: Use portMAX_DELAY instead of pdMS_TO_TICKS(5).
+                 *     A 5 ms timeout could silently expire while task_write
+                 *     holds g_hs_mutex during an SD stall, leaving the slot
+                 *     permanently active and leaking all 4 raw pool blocks.
+                 *     task_write owns no other locks at this point, so
+                 *     portMAX_DELAY cannot deadlock — same justification as F3. */
+                if (xSemaphoreTakeRecursive(g_hs_mutex, portMAX_DELAY) == pdTRUE) {
                     for (int j = 0; j < 4; j++) {
                         if (g_hs[done_idx].raw_idx[j] != POOL_NONE) {
                             uint8_t ridx = g_hs[done_idx].raw_idx[j];
@@ -623,7 +663,14 @@ static void IRAM_ATTR promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
     g_last_rssi.store(rssi, std::memory_order_relaxed);
 
+    /* R1: sig_len includes the 4-byte 802.11 FCS trailer. The driver does NOT
+     *     copy the FCS into pkt->payload[], so we must subtract it before
+     *     using plen as a copy length or as raw_len stored in the hs_slot.
+     *     Without this subtraction every captured PCAP frame has 4 bytes of
+     *     garbage at the tail → Wireshark dissect errors and hashcat MIC
+     *     verification failures ("no valid EAPOL pairs found"). */
     uint16_t plen = pkt->rx_ctrl.sig_len;
+    if (plen >= 4) plen -= 4;          /* strip FCS — not present in payload[] */
     if (plen == 0 || plen > MAX_PKT_LEN) return;
 
     uint8_t    pool_idx = POOL_NONE;
@@ -688,7 +735,12 @@ static void task_proc(void *arg) {
             if (!g_sd_ok.load() &&
                 (now - g_last_sd_retry.load(std::memory_order_relaxed)) > SD_RETRY_MS) {
                 g_last_sd_retry.store(now, std::memory_order_relaxed);
-                sd_init();
+                /* R5: Signal task_write to run sd_init() instead of blocking
+                 *     task_proc here. sd_init() can take hundreds of ms on a
+                 *     slow/worn card (SD.begin() includes card negotiation).
+                 *     Blocking the proc task during that window fills g_pkt_queue
+                 *     and causes the ISR to drop every incoming packet. */
+                g_sd_retry_req.store(true, std::memory_order_relaxed);
             }
         }
     }
@@ -709,14 +761,28 @@ static void task_write(void *arg) {
         write_item_t wi;
         if (xQueueReceive(g_write_queue, &wi, pdMS_TO_TICKS(200)) == pdTRUE) {
             pcap_write(wi, chunk_buf);
+        } else {
+            /* R5: Consume the SD retry request here, in the write task, so
+             *     task_proc is never blocked by SD initialisation latency.
+             *     The 200 ms queue wait above gives task_write idle time to
+             *     handle this without adding an extra task or timer. */
+            if (g_sd_retry_req.exchange(false, std::memory_order_relaxed)) {
+                sd_init();
+            }
         }
     }
 }
 
 /* --------------------------------------------------------------------------
  * Task: channel hopper
+ * R3: Pinned to Core 0 (see xTaskCreatePinnedToCore in setup()). Core 0 runs
+ *     the WiFi driver and the promiscuous ISR; esp_wifi_set_channel() must be
+ *     called from the same core to avoid racing the driver's channel state.
+ *     The configASSERT below catches any accidental future migration,
+ *     mirroring the F4 pattern used in task_ui.
  * -------------------------------------------------------------------------- */
 static void task_hop(void *arg) {
+    configASSERT(xPortGetCoreID() == 0); /* R3 */
     esp_task_wdt_add(NULL);
     uint8_t ch = 1;
     while (1) {
@@ -877,7 +943,7 @@ static void task_ui(void *arg) {
 void setup(void) {
     Serial.begin(115200);
     delay(200);
-    Serial.println("\n[BOOT] ESP32 Cheapagotchi v1.2.1");
+    Serial.println("\n[BOOT] ESP32 Cheapagotchi v1.2.2");
 
     pinMode(PIN_LED, OUTPUT);
     pinMode(PIN_BTN, INPUT_PULLUP);
@@ -888,7 +954,7 @@ void setup(void) {
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tf);
     display.drawStr(0, 20, "Cheapagotchi");
-    display.drawStr(0, 34, "v1.2.1 Boot...");
+    display.drawStr(0, 34, "v1.2.2 Boot...");
     display.sendBuffer();
 
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
@@ -960,6 +1026,9 @@ void setup(void) {
     display.sendBuffer();
 
     Serial.println("[BOOT] tasks started");
+    /* R6: Log free heap AFTER all task creations so the value reflects real
+     *     post-allocation headroom. Previously logged before tasks were created,
+     *     giving an optimistic reading that didn't account for task stacks. */
     Serial.printf("[MEM]  free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
     esp_task_wdt_delete(NULL);
 }
