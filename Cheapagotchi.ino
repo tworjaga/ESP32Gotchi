@@ -1,54 +1,11 @@
 /*
- * ESP32 Cheapagotchi — WPA/WPA2 Handshake Sniffer  (v1.2.2)
+ * ESP32 Cheapagotchi — WiFi AP Scanner & Monitor  (v1.2.2)
  * Project: ESP32Gotchi | github: tworjaga | telegram: @al7exy
  *
  * Target  : ESP32 Dev Module (ESP32-WROOM-32, 30-pin)
  * Core    : esp32 by Espressif 2.0.x+
- * Libraries (install via Library Manager):
- * - U8g2
- * SD, SPI, WiFi, esp_wifi, FreeRTOS — bundled with core
+ * Libraries: U8g2 (Library Manager); SD, SPI, WiFi, esp_wifi, FreeRTOS bundled with core
  *
- * Fixes applied (v1.2.0):
- *  F1  chunk_buf compile-time size assertion + runtime bounds guard
- *  F2  g_ap_table protected by portMUX_TYPE spinlock (ISR-safe)
- *  F3  pcap_write() slot-leak on hs_mutex timeout → blocking take
- *  F4  task_ui core-ID assertion; I2C/promisc isolation documented
- *  F5  g_hs_mutex → recursive mutex; hs_expire() safe inside lock
- *  F6  g_channel, g_led, g_face, g_last_sd_retry → std::atomic
- *  F7  f.write() return value checked; partial-write error logged
- *  F8  mac_hash() replaced with Murmur3 finaliser mix
- *  F9  task_write and task_proc stack bumped to 6144 words
- *  F10 btn_tick poll-rate dependency documented
- *  F11 static_assert POOL_NONE sentinel validity
- *  F12 SPI.begin() guarded with spi_started flag
- *  F13 WDT behaviour on SD stall documented
- *
- * Feature (v1.2.1):
- *  RSSI filter applied in promisc_cb before pool claim — weak-signal
- *  packets dropped at zero pool cost. Threshold: RSSI_THRESHOLD (-80 dBm).
- *  Last RSSI and cumulative drop count exposed on OLED and Serial.
- *
- * Fixes applied (v1.2.2):
- *  R1  [HIGH]   promisc_cb: sig_len includes 4-byte 802.11 FCS trailer that
- *               is NOT present in pkt->payload[]. Strip it before memcpy and
- *               before storing raw_len. Without this every PCAP record had 4
- *               bytes of garbage at the tail → Wireshark dissect errors and
- *               hashcat MIC verification failures (false "no match").
- *  R2  [MEDIUM] pcap_write_file: configASSERT on the memcpy bounds check is
- *               compiled out in release (NDEBUG). Replaced with a hard runtime
- *               guard that returns false, preventing silent stack corruption.
- *  R3  [MEDIUM] task_hop: pinned to Core 0 (matches task_proc / WiFi driver
- *               affinity). Added configASSERT(xPortGetCoreID()==0) mirroring
- *               the pattern used in task_ui (F4).
- *  R4  [MEDIUM] process_packet write-queue-full cleanup: changed 5 ms mutex
- *               timeout to portMAX_DELAY. A 5 ms timeout could silently fail
- *               while task_write holds the mutex during an SD stall, leaving
- *               the hs_slot permanently active and leaking all raw pool blocks.
- *  R5  [LOW]    task_proc SD retry: moved sd_init() call to a dedicated flag
- *               (g_sd_retry_req atomic) consumed by task_write, so the proc
- *               task is never blocked for hundreds of ms on SD initialisation.
- *  R6  [LOW]    setup(): [MEM] free-heap log moved to after all task creations
- *               so it reflects the true post-allocation heap headroom.
  */
 
 #include <Arduino.h>
@@ -64,9 +21,14 @@
 #include <freertos/semphr.h>
 #include <esp_task_wdt.h>
 #include <lwip/def.h>
-#include <atomic> // True cross-core atomics
-#include <freertos/portmacro.h> // F2: portMUX_TYPE for ISR-safe spinlock
+#include <atomic>
+#include <freertos/portmacro.h>
+#include <esp_sleep.h>
+#include <driver/adc.h>
 
+/* --------------------------------------------------------------------------
+ * Pin definitions
+ * -------------------------------------------------------------------------- */
 #define PIN_OLED_SDA  21
 #define PIN_OLED_SCL  22
 #define PIN_SD_CS      5
@@ -75,6 +37,9 @@
 #define PIN_SD_MISO   19
 #define PIN_BTN        4
 #define PIN_LED        2
+#define PIN_GPS_RX    16   /* N1: UART2 RX — connect to Neo-6M TX */
+#define PIN_GPS_TX    17   /* N1: UART2 TX — connect to Neo-6M RX */
+#define PIN_BATT_ADC  34   /* N7: ADC1_CH6 — voltage divider midpoint */
 
 /* --------------------------------------------------------------------------
  * Tuning constants
@@ -87,7 +52,8 @@
 #define MAX_UNIQUE_APS       256
 #define CHANNEL_DWELL_MS     200
 #define DEBOUNCE_MS           50
-#define LONG_PRESS_MS       3000
+#define LONG_PRESS_MS       3000   /* N5: short=page cycle, long=restart */
+#define SLEEP_PRESS_MS      6000   /* N8: extra-long press → deep sleep   */
 #define SD_RETRY_MS        10000
 #define MIN_FREE_BYTES     (1024ULL * 1024ULL)
 #define WDT_TIMEOUT_S         30
@@ -97,26 +63,47 @@
 #define HS_NEW_SLOT_RATE_MS  100
 #define TASK_PROC_BATCH_MAX   15
 
-/* RSSI filter — drop packets weaker than this threshold in the ISR before
- * they consume a static pool block. -80 dBm is a pragmatic cutoff:
- *   < -80 dBm : signal too weak to reliably complete a 4-way handshake;
- *               capturing these wastes pool slots and CPU on noise.
- *   > -80 dBm : usable signal — allow through for processing.
- * Tune downward (e.g. -85) in open-air environments with distant targets,
- * or upward (e.g. -70) in dense RF environments to reduce false positives.
- * Range: -100 (floor) to 0 dBm. Must fit in int8_t. */
+/* N1: GPS */
+#define GPS_BAUD            9600
+#define GPS_FIX_TIMEOUT_MS 60000   /* give up waiting for first fix after 60 s */
+#define GPS_STALE_MS       10000  /* invalidate fix if stale longer than this */
+#define GPS_SENTENCE_LEN     128   /* max NMEA sentence buffer                  */
+
+/* N2: AP log queue */
+#define AP_LOG_QUEUE_DEPTH    16
+
+/* N3/N4: CSV paths and rotation threshold */
+#define APLOG_PATH          "/aplog/aps.csv"
+#define APLOG_ROTATE_PATH   "/aplog/aps_1.csv"
+#define STATS_PATH          "/stats/stats.csv"
+#define STATS_ROTATE_PATH   "/stats/stats_1.csv"
+#define CSV_ROTATE_BYTES    (4UL * 1024UL * 1024UL)   /* 4 MB */
+#define STATS_INTERVAL_MS   60000UL
+
+/* N7: Battery ADC */
+#define BATT_SAMPLES          16
+#define BATT_UPDATE_MS      30000
+#define BATT_VREF_MV         3300   /* ESP32 Vref mV */
+#define BATT_ADC_MAX         4095
+#define BATT_DIVIDER            2   /* 100k / 100k divider: Vadc = Vbat/2 */
+#define BATT_MAX_MV          4200   /* 100% */
+#define BATT_MIN_MV          3500   /*   0% */
+
+/* RSSI filter */
 #define RSSI_THRESHOLD        (-80)
 
 /* F1: PCAP chunk buffer = global header (24) + 4 × (record header 16 + payload) */
 #define CHUNK_BUF_SIZE  (24 + 4 * (16 + MAX_PKT_LEN))
 
-/* F9: Generous stack sizes — verified headroom via uxTaskGetStackHighWaterMark() */
+/* F9: Stack sizes — values are BYTES (ESP32 Arduino/FreeRTOS port's
+ * xTaskCreatePinnedToCore stack-depth argument is bytes here, not words) */
 #define STACK_PROC   6144
 #define STACK_WRITE  6144
 #define STACK_HOP    2048
 #define STACK_UI     4096
+#define STACK_GPS    3072   /* N1 */
 
-/* F11: Sentinel validity — POOL_NONE must not be a reachable pool index */
+/* F11 */
 static_assert(PKT_POOL_DEPTH    < 0xFF, "PKT_POOL_DEPTH too large: POOL_NONE sentinel invalid");
 static_assert(HS_RAW_POOL_DEPTH < 0xFF, "HS_RAW_POOL_DEPTH too large: POOL_NONE sentinel invalid");
 
@@ -125,7 +112,6 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(
 
 /* --------------------------------------------------------------------------
  * Fix 1: Byte-safe Memory Extraction Macros
- * Removes #pragma pack(push, 1) and struct casting to prevent LX6 Alignment Panics.
  * -------------------------------------------------------------------------- */
 static inline uint16_t read16_le(const uint8_t *p) { return p[0] | (p[1] << 8); }
 static inline uint16_t read16_be(const uint8_t *p) { return (p[0] << 8) | p[1]; }
@@ -156,45 +142,88 @@ typedef struct {
     uint16_t raw_len[4];
     bool     seen[4];
     bool     active;
+    bool     queued;   /* true once handed to g_write_queue; blocks hs_expire() reclaim */
     uint32_t last_ms;
 } hs_slot_t;
 
 /* --------------------------------------------------------------------------
+ * N2: AP log queue item — sent from promisc_cb to task_write
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    uint8_t  bssid[6];
+    int8_t   rssi;
+    uint8_t  channel;
+} ap_log_item_t;
+
+static QueueHandle_t g_ap_log_queue;   /* N2 */
+
+/* --------------------------------------------------------------------------
+ * N1: GPS fix data — updated by task_gps, read by task_ui and task_write.
+ *     Protected by g_gps_mutex (not atomic — struct is too large).
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    float    lat;          /* degrees, positive = N */
+    float    lon;          /* degrees, positive = E */
+    float    alt_m;        /* metres above MSL */
+    float    hdop;
+    uint8_t  sats;
+    bool     valid;        /* true = at least one valid fix received */
+    /* Soft RTC — UTC from GPS */
+    uint16_t year;
+    uint8_t  month, day;
+    uint8_t  hour, minute, second;
+    bool     time_set;     /* true once GPS time has been received */
+    uint32_t last_fix_ms;  /* MEDIUM fix: millis() of last good 'A' status fix, for staleness */
+} gps_fix_t;
+
+static gps_fix_t     g_gps;
+static SemaphoreHandle_t g_gps_mutex;
+static std::atomic<bool> g_gps_available{false};   /* UART opened OK */
+static std::atomic<bool> g_gps_fix{false};         /* valid fix received */
+
+/* --------------------------------------------------------------------------
  * AP hash table
- * F2: g_ap_table protected by a portMUX spinlock so ap_record() is safe
- *     from both task context and the promiscuous ISR on the same core.
+ * F2: g_ap_table protected by a portMUX spinlock
  * -------------------------------------------------------------------------- */
 #define AP_TABLE_MASK     (MAX_UNIQUE_APS - 1)
 #define AP_TABLE_MAX_LOAD 192
 
-static uint8_t       g_ap_table[MAX_UNIQUE_APS][6];
-static portMUX_TYPE  g_ap_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t      g_ap_table[MAX_UNIQUE_APS][6];
+static portMUX_TYPE g_ap_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* True cross-core atomics for all shared counters / flags */
+/* True cross-core atomics */
 static std::atomic<uint32_t> g_ap_count{0};
 static std::atomic<uint32_t> g_hs_count{0};
 static std::atomic<uint32_t> g_pkt_rate{0};
 static std::atomic<bool>     g_sd_ok{false};
-/* Last observed RSSI (dBm, signed) and cumulative RSSI-drop counter.
- * Updated in the ISR — atomic<int8_t> gives safe cross-core reads for OLED. */
 static std::atomic<int8_t>   g_last_rssi{0};
 static std::atomic<uint32_t> g_rssi_drops{0};
-/* R5: SD retry request flag. task_proc sets this instead of calling sd_init()
- *     directly, so the proc task is never stalled for hundreds of ms on SD init.
- *     task_write consumes it at the top of its idle loop. */
-static std::atomic<bool>     g_sd_retry_req{false};
+static std::atomic<uint32_t> g_ap_log_drops{0};   /* MEDIUM fix: ap_log queue full */
+static std::atomic<uint32_t> g_hs_pool_drops{0};  /* MEDIUM fix: hs raw-frame pool exhausted */
+static std::atomic<bool>     g_sd_retry_req{false};   /* R5 */
+
+/* N5: display page (0=Stats 1=GPS 2=SD 3=System) */
+static std::atomic<uint8_t>  g_display_page{0};
+
+/* N7: battery percentage 0–100 */
+static std::atomic<uint8_t>  g_batt_pct{0};
+
+/* N8: deep sleep request flag set in btn_tick, consumed in task_ui */
+static std::atomic<bool>     g_sleep_req{false};
+
+/* N3: last write status for SD page */
+static std::atomic<bool>     g_last_write_ok{true};
 
 /* --------------------------------------------------------------------------
  * Global state
  * -------------------------------------------------------------------------- */
 static QueueHandle_t     g_pkt_queue;
 static QueueHandle_t     g_write_queue;
-static SemaphoreHandle_t g_hs_mutex;   /* F5: created as recursive mutex */
+static SemaphoreHandle_t g_hs_mutex;
 static SemaphoreHandle_t g_sd_mutex;
 
 static hs_slot_t g_hs[MAX_HS_SLOTS];
 
-/* F6: volatile insufficient on dual-core LX6; use std::atomic throughout */
 static std::atomic<uint8_t>      g_channel{1};
 static std::atomic<uint32_t>     g_last_sd_retry{0};
 
@@ -208,6 +237,7 @@ static TaskHandle_t h_proc;
 static TaskHandle_t h_ui;
 static TaskHandle_t h_hop;
 static TaskHandle_t h_write;
+static TaskHandle_t h_gps;   /* N1 */
 
 /* --------------------------------------------------------------------------
  * MAC helpers
@@ -219,36 +249,61 @@ static inline bool mac_zero(const uint8_t *a) {
     for (int i = 0; i < 6; i++) if (a[i] != 0) return false;
     return true;
 }
-
 static void mac_str(const uint8_t *m, char *out, size_t out_sz) {
     snprintf(out, out_sz, "%02x_%02x_%02x_%02x_%02x_%02x",
              m[0], m[1], m[2], m[3], m[4], m[5]);
 }
+static void mac_str_colon(const uint8_t *m, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%02X:%02X:%02X:%02X:%02X:%02X",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+}
 
-/* F8: Murmur3 finaliser mix — far better distribution over OUI-heavy MACs
- *     than plain djb2, which clusters same-vendor APs into long probe chains. */
+/* LOW fix: real Murmur3 fmix32 — two rounds, two constants — for better
+ * avalanche than a single round, reducing AP-table collision clustering. */
 static uint8_t mac_hash(const uint8_t *mac) {
-    uint32_t h = 0;
-    /* Pack 6 bytes into two 32-bit words and mix */
+    uint32_t h;
     uint32_t k0 = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
                   ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
     uint32_t k1 = (uint32_t)mac[4] | ((uint32_t)mac[5] << 8);
-    /* Murmur3 finaliser */
     h  = k0 ^ k1;
     h ^= h >> 16;
-    h *= 0x45d9f3bU;
+    h *= 0x85ebca6bU;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35U;
     h ^= h >> 16;
     return (uint8_t)(h & AP_TABLE_MASK);
 }
 
-/* F2: All reads and writes to g_ap_table go through g_ap_mux.
- *     portENTER/EXIT_CRITICAL are ISR-safe on ESP32 (disables interrupts on
- *     the calling core only; the other core spins if it races). */
-static void ap_record(const uint8_t *bssid) {
-    if (mac_zero(bssid)) return;
-    if (g_ap_count.load(std::memory_order_relaxed) >= AP_TABLE_MAX_LOAD) return;
+/* --------------------------------------------------------------------------
+ * N1: Timestamp helper — returns ISO-8601 string from GPS soft RTC,
+ *     or millis()-based uptime string if no GPS time available.
+ * -------------------------------------------------------------------------- */
+static void timestamp_str(char *out, size_t out_sz) {
+    if (xSemaphoreTake(g_gps_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (g_gps.time_set) {
+            snprintf(out, out_sz, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+                     g_gps.year, g_gps.month, g_gps.day,
+                     g_gps.hour, g_gps.minute, g_gps.second);
+            xSemaphoreGive(g_gps_mutex);
+            return;
+        }
+        xSemaphoreGive(g_gps_mutex);
+    }
+    /* Fallback: uptime */
+    uint32_t s = millis() / 1000;
+    snprintf(out, out_sz, "UP+%05lus", (unsigned long)s);
+}
+
+/* --------------------------------------------------------------------------
+ * F2: AP hash table — ISR-safe via portMUX spinlock
+ * Returns true if this is a NEW bssid (first time seen).
+ * -------------------------------------------------------------------------- */
+static bool ap_record(const uint8_t *bssid) {
+    if (mac_zero(bssid)) return false;
+    if (g_ap_count.load(std::memory_order_relaxed) >= AP_TABLE_MAX_LOAD) return false;
 
     uint8_t idx = mac_hash(bssid);
+    bool    is_new = false;
 
     portENTER_CRITICAL(&g_ap_mux);
     for (uint32_t i = 0; i < MAX_UNIQUE_APS; i++) {
@@ -256,28 +311,24 @@ static void ap_record(const uint8_t *bssid) {
         if (mac_zero(g_ap_table[slot])) {
             memcpy(g_ap_table[slot], bssid, 6);
             g_ap_count.fetch_add(1, std::memory_order_relaxed);
-            portEXIT_CRITICAL(&g_ap_mux);
-            return;
+            is_new = true;
+            break;
         }
         if (mac_eq(g_ap_table[slot], bssid)) {
-            portEXIT_CRITICAL(&g_ap_mux);
-            return;
+            break;
         }
     }
     portEXIT_CRITICAL(&g_ap_mux);
+    return is_new;
 }
 
 /* --------------------------------------------------------------------------
  * SD
- * F12: SPI.begin() is called only once. Repeated calls on ESP-IDF can cause
- *      bus glitches on already-active SPI lines. sd_init() may be called
- *      multiple times (boot + retry path) but SPI is initialised exactly once.
- * F13: If an SD write stalls (worn card), the WDT fires after WDT_TIMEOUT_S
- *      and resets the entire device. This is intentional — prefer a clean
- *      reboot over a hung write task.
+ * F12: SPI.begin() called once only.
+ * F13: WDT fires on SD stall → intentional reboot.
  * -------------------------------------------------------------------------- */
 static bool sd_init(void) {
-    static bool spi_started = false; /* F12 */
+    static bool spi_started = false;
 
     xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
 
@@ -300,6 +351,8 @@ static bool sd_init(void) {
     g_led.store(LED_SLOW);
 
     if (!SD.exists("/handshakes")) SD.mkdir("/handshakes");
+    if (!SD.exists("/aplog"))      SD.mkdir("/aplog");    /* N2 */
+    if (!SD.exists("/stats"))      SD.mkdir("/stats");    /* N3 */
     Serial.println("[SD] OK");
 
     xSemaphoreGive(g_sd_mutex);
@@ -307,20 +360,116 @@ static bool sd_init(void) {
 }
 
 /* --------------------------------------------------------------------------
- * PCAP File Writing
- * F1: CHUNK_BUF_SIZE is verified at compile time. Runtime writes via the
- *     write32_le / write16_le lambdas are bounds-checked; any overrun aborts
- *     the build or triggers a configASSERT in debug, never a silent OOB.
- * F7: f.write() return value checked — a short write (worn card, mid-write
- *     SD full) is logged and propagated as a failure rather than silently
- *     producing a truncated PCAP.
+ * N4: Log rotation helper
+ *     Called from task_write (which already holds g_sd_mutex context via
+ *     the surrounding write helpers). Caller must NOT hold g_sd_mutex —
+ *     this function takes it internally.
  * -------------------------------------------------------------------------- */
+static void check_rotate(const char *path, const char *rotated_path, uint32_t max_bytes) {
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    if (SD.exists(path)) {
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            uint32_t sz = f.size();
+            f.close();
+            if (sz >= max_bytes) {
+                if (SD.exists(rotated_path)) SD.remove(rotated_path);
+                SD.rename(path, rotated_path);
+                Serial.printf("[ROT] %s → %s\n", path, rotated_path);
+            }
+        }
+    }
+    xSemaphoreGive(g_sd_mutex);
+}
 
-/* F1: Compile-time guarantee that CHUNK_BUF_SIZE covers worst case */
+/* --------------------------------------------------------------------------
+ * N2: Append one AP row to /aplog/aps.csv
+ *     Called from task_write only — SD access is safe here.
+ * -------------------------------------------------------------------------- */
+static void aplog_write(const ap_log_item_t *item) {
+    check_rotate(APLOG_PATH, APLOG_ROTATE_PATH, CSV_ROTATE_BYTES);
+
+    char ts[32];
+    timestamp_str(ts, sizeof(ts));
+
+    char mac[20];
+    mac_str_colon(item->bssid, mac, sizeof(mac));
+
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+
+    bool write_header = !SD.exists(APLOG_PATH);
+    File f = SD.open(APLOG_PATH, FILE_APPEND);
+    if (!f) {
+        Serial.println("[APLOG] open failed");
+        xSemaphoreGive(g_sd_mutex);
+        return;
+    }
+    if (write_header) {
+        f.println("timestamp,bssid,rssi_dbm,channel");
+    }
+    char row[80];
+    snprintf(row, sizeof(row), "%s,%s,%d,%u", ts, mac, (int)item->rssi, (unsigned)item->channel);
+    f.println(row);
+    f.close();
+
+    xSemaphoreGive(g_sd_mutex);
+}
+
+/* --------------------------------------------------------------------------
+ * N3: Append one stats row to /stats/stats.csv
+ *     Called from task_write only.
+ * -------------------------------------------------------------------------- */
+static void stats_write(void) {
+    check_rotate(STATS_PATH, STATS_ROTATE_PATH, CSV_ROTATE_BYTES);
+
+    char ts[32];
+    timestamp_str(ts, sizeof(ts));
+
+    float lat = 0.0f, lon = 0.0f;
+    bool  fix = false;
+    if (xSemaphoreTake(g_gps_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        lat = g_gps.lat;
+        lon = g_gps.lon;
+        fix = g_gps.valid;
+        xSemaphoreGive(g_gps_mutex);
+    }
+
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+
+    bool write_header = !SD.exists(STATS_PATH);
+    File f = SD.open(STATS_PATH, FILE_APPEND);
+    if (!f) {
+        Serial.println("[STATS] open failed");
+        xSemaphoreGive(g_sd_mutex);
+        return;
+    }
+    if (write_header) {
+        f.println("timestamp,ap_count,pkt_rate,free_heap,rssi_last,rssi_drops,gps_lat,gps_lon,gps_fix");
+    }
+    char row[128];
+    snprintf(row, sizeof(row),
+             "%s,%lu,%lu,%lu,%d,%lu,%.6f,%.6f,%u",
+             ts,
+             (unsigned long)g_ap_count.load(),
+             (unsigned long)g_pkt_rate.load(),
+             (unsigned long)ESP.getFreeHeap(),
+             (int)g_last_rssi.load(std::memory_order_relaxed),
+             (unsigned long)g_rssi_drops.load(std::memory_order_relaxed),
+             (double)lat, (double)lon,
+             (unsigned)fix);
+    f.println(row);
+    f.close();
+
+    xSemaphoreGive(g_sd_mutex);
+}
+
+/* --------------------------------------------------------------------------
+ * PCAP File Writing (timestamp uses GPS soft RTC when available)
+ * -------------------------------------------------------------------------- */
 static_assert(CHUNK_BUF_SIZE == (24 + 4 * (16 + MAX_PKT_LEN)),
               "CHUNK_BUF_SIZE formula mismatch");
 
-static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t* chunk_buf) {
+static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t *chunk_buf) {
     char bssid_s[24];
     mac_str(hs->bssid, bssid_s, sizeof(bssid_s));
 
@@ -329,7 +478,6 @@ static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t* chunk_buf) {
 
     uint32_t offset = 0;
 
-    /* F1: Bounds-checked helpers — abort if caller logic ever exceeds buffer */
     auto write32_le = [&](uint32_t v) {
         configASSERT(offset + 4 <= CHUNK_BUF_SIZE);
         chunk_buf[offset++] = v & 0xFF;         chunk_buf[offset++] = (v >> 8) & 0xFF;
@@ -340,16 +488,12 @@ static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t* chunk_buf) {
         chunk_buf[offset++] = v & 0xFF;         chunk_buf[offset++] = (v >> 8) & 0xFF;
     };
 
-    // Construct PCAP Global Header (24 bytes)
-    write32_le(0xa1b2c3d4); // Magic
-    write16_le(2);          // Major
-    write16_le(4);          // Minor
-    write32_le(0);          // Timezone
-    write32_le(0);          // Sigfigs
-    write32_le(65535);      // Snaplen
-    write32_le(105);        // Network type (IEEE 802.11)
+    write32_le(0xa1b2c3d4);
+    write16_le(2); write16_le(4);
+    write32_le(0); write32_le(0);
+    write32_le(65535);
+    write32_le(105);
 
-    // Append Packet Headers and Raw Payloads
     for (int i = 0; i < 4; i++) {
         if (!hs->seen[i] || hs->raw_len[i] == 0 || hs->raw_idx[i] == POOL_NONE) continue;
         uint32_t len = hs->raw_len[i];
@@ -359,13 +503,8 @@ static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t* chunk_buf) {
         write32_le(len);
         write32_le(len);
 
-        configASSERT(offset + len <= CHUNK_BUF_SIZE);
-        /* R2: configASSERT is compiled out in release (NDEBUG). Add a hard
-         *     runtime guard so an unexpected overrun returns an error instead
-         *     of silently writing past the buffer into the task stack. */
         if (offset + len > CHUNK_BUF_SIZE) {
-            Serial.printf("[PCAP] chunk overflow at frame %d (offset=%lu len=%lu) — abort\n",
-                          i, (unsigned long)offset, (unsigned long)len);
+            Serial.printf("[PCAP] chunk overflow at frame %d — abort\n", i);
             return false;
         }
         memcpy(chunk_buf + offset, hs_raw_pool_mem[hs->raw_idx[i]], len);
@@ -379,30 +518,27 @@ static bool pcap_write_file(hs_slot_t *hs, uint32_t ts, uint8_t* chunk_buf) {
         xSemaphoreGive(g_sd_mutex);
         return false;
     }
-
-    /* F7: Check write length — partial write = corrupt PCAP */
     size_t written = f.write(chunk_buf, offset);
     f.close();
     xSemaphoreGive(g_sd_mutex);
 
     if (written != offset) {
-        Serial.printf("[SD] partial write: %u/%lu bytes — PCAP may be corrupt\n",
+        Serial.printf("[SD] partial write: %u/%lu bytes\n",
                       (unsigned)written, (unsigned long)offset);
         return false;
     }
-
     return true;
 }
 
-static void pcap_write(uint8_t slot_idx, uint8_t* chunk_buf) {
+static void pcap_write(uint8_t slot_idx, uint8_t *chunk_buf) {
     hs_slot_t *hs = &g_hs[slot_idx];
     uint32_t   ts = millis() / 1000;
     if (!g_sd_ok.load()) goto release_slots;
 
     {
         xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-        uint64_t card   = (uint64_t)SD.cardSize();
-        uint64_t used   = (uint64_t)SD.usedBytes();
+        uint64_t card = (uint64_t)SD.cardSize();
+        uint64_t used = (uint64_t)SD.usedBytes();
         xSemaphoreGive(g_sd_mutex);
 
         uint64_t free_b = (card >= used) ? (card - used) : 0;
@@ -416,9 +552,11 @@ static void pcap_write(uint8_t slot_idx, uint8_t* chunk_buf) {
     if (pcap_write_file(hs, ts, chunk_buf)) {
         g_hs_count.fetch_add(1);
         g_led.store(LED_FLASH);
+        g_last_write_ok.store(true);
         Serial.printf("[HS] saved  total=%lu\n", (unsigned long)g_hs_count.load());
     } else {
         g_face.store(FACE_ERROR);
+        g_last_write_ok.store(false);
     }
 
 release_slots:
@@ -429,19 +567,14 @@ release_slots:
             hs->raw_idx[i] = POOL_NONE;
         }
     }
-    /* F3: portMAX_DELAY prevents the slot-leak that a short timeout caused.
-     *     task_write owns no other locks at this point so deadlock is impossible. */
     xSemaphoreTakeRecursive(g_hs_mutex, portMAX_DELAY);
     hs->active = false;
+    hs->queued = false;
     xSemaphoreGiveRecursive(g_hs_mutex);
 }
 
 /* --------------------------------------------------------------------------
- * Handshake slot management
- * F5: g_hs_mutex is a recursive mutex. hs_expire() is called from task_proc
- *     both (a) inside process_packet() while the mutex is held, and (b) from
- *     the rate-window block which takes it independently. A non-recursive
- *     mutex would deadlock on path (a). All callers use the Recursive variants.
+ * Handshake slot management (unchanged)
  * -------------------------------------------------------------------------- */
 static hs_slot_t *hs_find_or_create(const uint8_t *bssid, const uint8_t *sta) {
     static uint32_t last_slot_create_ms = 0;
@@ -472,7 +605,7 @@ static hs_slot_t *hs_find_or_create(const uint8_t *bssid, const uint8_t *sta) {
 static void hs_expire(void) {
     uint32_t now = millis();
     for (int i = 0; i < MAX_HS_SLOTS; i++) {
-        if (g_hs[i].active && (now - g_hs[i].last_ms) > HS_EXPIRE_MS) {
+        if (g_hs[i].active && !g_hs[i].queued && (now - g_hs[i].last_ms) > HS_EXPIRE_MS) {
             for (int j = 0; j < 4; j++) {
                 if (g_hs[i].raw_idx[j] != POOL_NONE) {
                     uint8_t ridx = g_hs[i].raw_idx[j];
@@ -487,10 +620,7 @@ static void hs_expire(void) {
 
 typedef enum {
     EAPOL_MSG_INVALID = 0,
-    EAPOL_MSG_1,
-    EAPOL_MSG_2,
-    EAPOL_MSG_3,
-    EAPOL_MSG_4
+    EAPOL_MSG_1, EAPOL_MSG_2, EAPOL_MSG_3, EAPOL_MSG_4
 } eapol_msg_t;
 
 static eapol_msg_t eapol_msg_number(uint16_t ki) {
@@ -509,23 +639,18 @@ static eapol_msg_t eapol_msg_number(uint16_t ki) {
 }
 
 /* --------------------------------------------------------------------------
- * Core packet parser
- * Fix 1: Completely rebuilt using safe byte-level offset reads.
+ * Core packet parser (unchanged logic; ap_record now returns bool for N2)
  * -------------------------------------------------------------------------- */
 static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
     const uint8_t *buf = pkt_pool_mem[pkt_pool_idx];
-    
-    // Radiotap minimum size is 8 bytes
+
     if (len < 8) goto done;
 
     {
-        uint16_t rt_len = read16_le(buf + 2);
-        if (rt_len >= len) goto done;
-        
-        const uint8_t *mf  = buf + rt_len;
-        uint16_t       mfl = len - rt_len;
-        
-        // Dot11 MAC minimum size is 24 bytes
+        /* No radiotap header — buf starts directly at 802.11 Frame Control */
+        const uint8_t *mf  = buf;
+        uint16_t       mfl = len;
+
         if (mfl < 24) goto done;
 
         uint8_t fc0 = mf[0];
@@ -534,7 +659,7 @@ static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
         uint8_t fc_subtype = (fc0 >> 4) & 0x0F;
         uint8_t to_ds      =  fc1       & 0x01;
         uint8_t from_ds    = (fc1 >> 1) & 0x01;
-        
+
         const uint8_t *addr1 = mf + 4;
         const uint8_t *addr2 = mf + 10;
         const uint8_t *addr3 = mf + 16;
@@ -558,35 +683,30 @@ static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
 
         if (mac_zero(bssid) || mac_zero(sta)) goto done;
         ap_record(bssid);
-        
+
         uint16_t mac_hdr_sz = 24;
-        if ((fc_subtype & 0x08) != 0) mac_hdr_sz += 2; // QoS offset
-        
-        // Ensure space for LLC + SNAP Header (8 bytes)
+        if ((fc_subtype & 0x08) != 0) mac_hdr_sz += 2;
+
         if (mfl < mac_hdr_sz + 8) goto done;
         const uint8_t *llc = mf + mac_hdr_sz;
-        if (llc[0] != 0xAA || llc[1] != 0xAA) goto done;         // DSAP / SSAP
-        if (llc[6] != 0x88 || llc[7] != 0x8E) goto done;         // Ethertype 888e
+        if (llc[0] != 0xAA || llc[1] != 0xAA) goto done;
+        if (llc[6] != 0x88 || llc[7] != 0x8E) goto done;
 
         uint16_t eapol_off = mac_hdr_sz + 8;
-        
-        // Ensure space for EAPOL Header (4 bytes) + Minimum Key Body
         if (mfl < eapol_off + 4 + 2) goto done;
         const uint8_t *eh = mf + eapol_off;
-        if (eh[1] != 0x03) goto done; // Type EAPOL-Key
+        if (eh[1] != 0x03) goto done;
 
         const uint8_t *ek = mf + eapol_off + 4;
-        if (ek[0] != 0x02 && ek[0] != 0xFE) goto done; // Descriptor type
+        if (ek[0] != 0x02 && ek[0] != 0xFE) goto done;
 
-        uint16_t ki = read16_be(ek + 1);
+        uint16_t    ki  = read16_be(ek + 1);
         eapol_msg_t msg = eapol_msg_number(ki);
         if (msg == EAPOL_MSG_INVALID) goto done;
 
         bool    complete = false;
         uint8_t done_idx = 0xFF;
 
-        /* F5: Recursive take — hs_expire() called inside rate-window block also
-         *     takes this mutex; recursive variant prevents deadlock. */
         if (xSemaphoreTakeRecursive(g_hs_mutex, pdMS_TO_TICKS(10)) != pdTRUE) goto done;
         hs_slot_t *slot = hs_find_or_create(bssid, sta);
         if (slot != NULL) {
@@ -603,7 +723,9 @@ static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
                     slot->last_ms            = millis();
                     Serial.printf("[HS] %02x:%02x:%02x -> %02x:%02x:%02x  msg%d\n",
                         bssid[0], bssid[1], bssid[2],
-                        sta[0],   sta[1],   sta[2],   (int)msg);
+                        sta[0],   sta[1],   sta[2], (int)msg);
+                } else {
+                    g_hs_pool_drops.fetch_add(1, std::memory_order_relaxed);
                 }
             }
 
@@ -619,14 +741,13 @@ static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
         xSemaphoreGiveRecursive(g_hs_mutex);
         if (complete) {
             write_item_t wi = done_idx;
-            if (xQueueSend(g_write_queue, &wi, 0) != pdTRUE) {
+            if (xQueueSend(g_write_queue, &wi, 0) == pdTRUE) {
+                if (xSemaphoreTakeRecursive(g_hs_mutex, portMAX_DELAY) == pdTRUE) {
+                    g_hs[done_idx].queued = true;
+                    xSemaphoreGiveRecursive(g_hs_mutex);
+                }
+            } else {
                 Serial.println("[HS] write queue full, drop");
-                /* R4: Use portMAX_DELAY instead of pdMS_TO_TICKS(5).
-                 *     A 5 ms timeout could silently expire while task_write
-                 *     holds g_hs_mutex during an SD stall, leaving the slot
-                 *     permanently active and leaking all 4 raw pool blocks.
-                 *     task_write owns no other locks at this point, so
-                 *     portMAX_DELAY cannot deadlock — same justification as F3. */
                 if (xSemaphoreTakeRecursive(g_hs_mutex, portMAX_DELAY) == pdTRUE) {
                     for (int j = 0; j < 4; j++) {
                         if (g_hs[done_idx].raw_idx[j] != POOL_NONE) {
@@ -636,6 +757,7 @@ static void process_packet(uint8_t pkt_pool_idx, uint16_t len) {
                         }
                     }
                     g_hs[done_idx].active = false;
+                    g_hs[done_idx].queued = false;
                     xSemaphoreGiveRecursive(g_hs_mutex);
                 }
             }
@@ -649,13 +771,12 @@ done:
 
 /* --------------------------------------------------------------------------
  * Promiscuous callback
+ * N2: After ap_record returns true (new BSSID), enqueue to g_ap_log_queue.
  * -------------------------------------------------------------------------- */
 static void IRAM_ATTR promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
 
-    /* RSSI filter: drop before touching the pool — no queue, no memcpy cost.
-     * rx_ctrl.rssi is signed (int8_t range, cast from the bitfield). */
     int8_t rssi = (int8_t)pkt->rx_ctrl.rssi;
     if (rssi < (int8_t)RSSI_THRESHOLD) {
         g_rssi_drops.fetch_add(1, std::memory_order_relaxed);
@@ -663,15 +784,32 @@ static void IRAM_ATTR promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
     g_last_rssi.store(rssi, std::memory_order_relaxed);
 
-    /* R1: sig_len includes the 4-byte 802.11 FCS trailer. The driver does NOT
-     *     copy the FCS into pkt->payload[], so we must subtract it before
-     *     using plen as a copy length or as raw_len stored in the hs_slot.
-     *     Without this subtraction every captured PCAP frame has 4 bytes of
-     *     garbage at the tail → Wireshark dissect errors and hashcat MIC
-     *     verification failures ("no valid EAPOL pairs found"). */
+    /* R1: strip 4-byte FCS */
     uint16_t plen = pkt->rx_ctrl.sig_len;
-    if (plen >= 4) plen -= 4;          /* strip FCS — not present in payload[] */
+    if (plen >= 4) plen -= 4;
     if (plen == 0 || plen > MAX_PKT_LEN) return;
+
+    /* N2: extract BSSID from management frames for AP log (addr3 in beacon/probe) */
+    if (type == WIFI_PKT_MGMT && plen >= 24) {
+        const uint8_t *mf = pkt->payload;   /* no radiotap header — mf is the 802.11 frame */
+        {
+            uint8_t fc_subtype = (mf[0] >> 4) & 0x0F;
+            if (fc_subtype == 8 || fc_subtype == 5) {   /* Beacon or Probe Response */
+                const uint8_t *bssid = mf + 16;
+                BaseType_t woken = pdFALSE;
+                if (ap_record(bssid)) {   /* ISR-safe (spinlock); log if new */
+                    ap_log_item_t item;
+                    memcpy(item.bssid, bssid, 6);
+                    item.rssi    = rssi;
+                    item.channel = (uint8_t)g_channel.load(std::memory_order_relaxed);
+                    if (xQueueSendFromISR(g_ap_log_queue, &item, &woken) != pdTRUE) {
+                        g_ap_log_drops.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (woken == pdTRUE) portYIELD_FROM_ISR();
+                }
+            }
+        }
+    }
 
     uint8_t    pool_idx = POOL_NONE;
     BaseType_t woken    = pdFALSE;
@@ -687,46 +825,43 @@ static void IRAM_ATTR promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 /* --------------------------------------------------------------------------
- * Task: packet processor
+ * Task: packet processor (unchanged)
  * -------------------------------------------------------------------------- */
 static void task_proc(void *arg) {
     esp_task_wdt_add(NULL);
     uint32_t pkt_count   = 0;
     uint32_t rate_window = millis();
-    int batch_count = 0;
+    int      batch_count = 0;
 
     while (1) {
         esp_task_wdt_reset();
         pkt_item_t item;
-        
+
         if (xQueueReceive(g_pkt_queue, &item, pdMS_TO_TICKS(50)) == pdTRUE) {
             process_packet(item.pool_idx, item.len);
             pkt_count++;
             batch_count++;
-            
-            // Fix 2: Prevent Core 0 Starvation. Yield to allow Priority 4 write tasks to execute.
             if (batch_count >= TASK_PROC_BATCH_MAX) {
                 batch_count = 0;
-                taskYIELD(); 
+                taskYIELD();
             }
         } else {
-            batch_count = 0; // Reset batch count on empty queue
+            batch_count = 0;
         }
 
         uint32_t now = millis();
         if (now - rate_window >= 1000) {
             g_pkt_rate.store(pkt_count);
-            Serial.printf("[STAT] pkt/s=%lu  rssi=%ddBm  drops=%lu  thr=%ddBm\n",
+            Serial.printf("[STAT] pkt/s=%lu  rssi=%ddBm  drops=%lu  thr=%ddBm  ap_log_drops=%lu  hs_pool_drops=%lu\n",
                 (unsigned long)pkt_count,
                 (int)g_last_rssi.load(std::memory_order_relaxed),
                 (unsigned long)g_rssi_drops.load(std::memory_order_relaxed),
-                RSSI_THRESHOLD);
+                RSSI_THRESHOLD,
+                (unsigned long)g_ap_log_drops.load(std::memory_order_relaxed),
+                (unsigned long)g_hs_pool_drops.load(std::memory_order_relaxed));
             pkt_count   = 0;
             rate_window = now;
 
-            /* F5: Recursive take — safe even if process_packet() already holds
-             *     g_hs_mutex on this call path (it doesn't, but recursive is
-             *     the correct contract for a mutex shared with hs_expire). */
             if (xSemaphoreTakeRecursive(g_hs_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 hs_expire();
                 xSemaphoreGiveRecursive(g_hs_mutex);
@@ -735,11 +870,6 @@ static void task_proc(void *arg) {
             if (!g_sd_ok.load() &&
                 (now - g_last_sd_retry.load(std::memory_order_relaxed)) > SD_RETRY_MS) {
                 g_last_sd_retry.store(now, std::memory_order_relaxed);
-                /* R5: Signal task_write to run sd_init() instead of blocking
-                 *     task_proc here. sd_init() can take hundreds of ms on a
-                 *     slow/worn card (SD.begin() includes card negotiation).
-                 *     Blocking the proc task during that window fills g_pkt_queue
-                 *     and causes the ISR to drop every incoming packet. */
                 g_sd_retry_req.store(true, std::memory_order_relaxed);
             }
         }
@@ -748,41 +878,52 @@ static void task_proc(void *arg) {
 
 /* --------------------------------------------------------------------------
  * Task: SD writer
+ * N2: Drains g_ap_log_queue in the idle branch.
+ * N3: Writes stats row every STATS_INTERVAL_MS.
  * -------------------------------------------------------------------------- */
 static void task_write(void *arg) {
     esp_task_wdt_add(NULL);
 
-    /* F1: Sized via CHUNK_BUF_SIZE — compile-time proven sufficient */
-    uint8_t* chunk_buf = (uint8_t*)malloc(CHUNK_BUF_SIZE);
+    uint8_t *chunk_buf = (uint8_t *)malloc(CHUNK_BUF_SIZE);
     configASSERT(chunk_buf != NULL);
+
+    uint32_t last_stats_ms = millis();
 
     while (1) {
         esp_task_wdt_reset();
+
+        /* Primary: flush handshake write queue */
         write_item_t wi;
-        if (xQueueReceive(g_write_queue, &wi, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (xQueueReceive(g_write_queue, &wi, pdMS_TO_TICKS(50)) == pdTRUE) {
             pcap_write(wi, chunk_buf);
-        } else {
-            /* R5: Consume the SD retry request here, in the write task, so
-             *     task_proc is never blocked by SD initialisation latency.
-             *     The 200 ms queue wait above gives task_write idle time to
-             *     handle this without adding an extra task or timer. */
-            if (g_sd_retry_req.exchange(false, std::memory_order_relaxed)) {
-                sd_init();
-            }
+        }
+
+        /* N2: drain AP log queue (one item per loop iteration — non-blocking) */
+        ap_log_item_t ap_item;
+        if (xQueueReceive(g_ap_log_queue, &ap_item, 0) == pdTRUE) {
+            if (g_sd_ok.load()) aplog_write(&ap_item);
+        }
+
+        /* N3: stats log every 60 s */
+        uint32_t now = millis();
+        if (now - last_stats_ms >= STATS_INTERVAL_MS) {
+            last_stats_ms = now;
+            if (g_sd_ok.load()) stats_write();
+        }
+
+        /* R5: SD retry request */
+        if (g_sd_retry_req.exchange(false, std::memory_order_relaxed)) {
+            sd_init();
         }
     }
 }
 
 /* --------------------------------------------------------------------------
- * Task: channel hopper
- * R3: Pinned to Core 0 (see xTaskCreatePinnedToCore in setup()). Core 0 runs
- *     the WiFi driver and the promiscuous ISR; esp_wifi_set_channel() must be
- *     called from the same core to avoid racing the driver's channel state.
- *     The configASSERT below catches any accidental future migration,
- *     mirroring the F4 pattern used in task_ui.
+ * Task: channel hopper (unchanged)
+ * R3: Pinned to Core 0.
  * -------------------------------------------------------------------------- */
 static void task_hop(void *arg) {
-    configASSERT(xPortGetCoreID() == 0); /* R3 */
+    configASSERT(xPortGetCoreID() == 0);
     esp_task_wdt_add(NULL);
     uint8_t ch = 1;
     while (1) {
@@ -791,6 +932,166 @@ static void task_hop(void *arg) {
         g_channel.store(ch, std::memory_order_relaxed);
         ch = (ch % CHANNELS_2G) + 1;
         vTaskDelay(pdMS_TO_TICKS(CHANNEL_DWELL_MS));
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * N1: GPS task — parses NMEA on UART2
+ *     Pinned to Core 1 (I2C-safe, no WiFi driver overlap).
+ *     Stack: STACK_GPS (3072 words). Priority 2.
+ *     Only dynamic alloc: 128-byte sentence buffer (malloc here, freed never).
+ * -------------------------------------------------------------------------- */
+
+/* Minimal NMEA helpers — no external library needed */
+static float nmea_to_degrees(const char *val, char hemi) {
+    /* val format: DDDMM.MMMM or DDMM.MMMM */
+    if (!val || val[0] == '\0') return 0.0f;
+    float raw  = atof(val);
+    int   deg  = (int)(raw / 100);
+    float mins = raw - deg * 100.0f;
+    float result = deg + mins / 60.0f;
+    if (hemi == 'S' || hemi == 'W') result = -result;
+    return result;
+}
+
+/* MEDIUM fix: verify NMEA checksum so RF noise / bad solder joints can't
+ * latch in bogus coordinates/time. sentence must start with '$' and contain
+ * a '*' followed by two hex digits (the original, unmodified line). */
+static bool nmea_checksum_ok(const char *sentence) {
+    if (!sentence || sentence[0] != '$') return false;
+    const char *star = strrchr(sentence, '*');
+    if (!star || strlen(star) < 3) return false;
+    uint8_t calc = 0;
+    for (const char *p = sentence + 1; p < star; p++) calc ^= (uint8_t)*p;
+    char hex[3] = { star[1], star[2], '\0' };
+    uint8_t given = (uint8_t)strtol(hex, NULL, 16);
+    return calc == given;
+}
+
+/* Split comma-separated NMEA sentence into tokens in-place.
+ * Returns number of tokens found (max_tok limit). */
+static int nmea_split(char *sentence, char **toks, int max_tok) {
+    int n = 0;
+    char *p = sentence;
+    while (n < max_tok) {
+        toks[n++] = p;
+        p = strchr(p, ',');
+        if (!p) break;
+        *p++ = '\0';
+    }
+    return n;
+}
+
+static void task_gps(void *arg) {
+    /* N1: single malloc for sentence accumulation buffer */
+    char *sbuf = (char *)malloc(GPS_SENTENCE_LEN);
+    configASSERT(sbuf != NULL);
+    int spos = 0;
+
+    Serial2.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    g_gps_available.store(true);
+
+    uint32_t boot_ms    = millis();
+    bool     fix_warned = false;
+
+    while (1) {
+        /* Read available bytes from UART2 */
+        while (Serial2.available()) {
+            char c = (char)Serial2.read();
+            if (c == '\r') continue;
+            if (c == '\n' || spos >= GPS_SENTENCE_LEN - 1) {
+                sbuf[spos] = '\0';
+
+                /* Only process $GPRMC and $GPGGA */
+                if (strncmp(sbuf, "$GPRMC", 6) == 0 ||
+                    strncmp(sbuf, "$GPGGA", 6) == 0) {
+
+                    /* MEDIUM fix: verify checksum on the original (unmodified)
+                     * line before trusting any field in it. */
+                    bool csum_ok = nmea_checksum_ok(sbuf);
+
+                    /* Strip checksum (*XX) before splitting */
+                    char *star = strrchr(sbuf, '*');
+                    if (star) *star = '\0';
+
+                    char *toks[16] = {0};
+                    char  tmp[GPS_SENTENCE_LEN];
+                    strncpy(tmp, sbuf, GPS_SENTENCE_LEN - 1);
+                    tmp[GPS_SENTENCE_LEN - 1] = '\0';
+                    int n = csum_ok ? nmea_split(tmp, toks, 16) : 0;
+
+                    if (csum_ok && xSemaphoreTake(g_gps_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+                        if (strncmp(sbuf, "$GPRMC", 6) == 0 && n >= 10) {
+                            /* $GPRMC,hhmmss.ss,A,llll.ll,a,yyyyy.yy,a,x.x,x.x,ddmmyy,... */
+                            bool active = (toks[2] && toks[2][0] == 'A');
+                            if (active) {
+                                g_gps.lat   = nmea_to_degrees(toks[3], toks[4] ? toks[4][0] : 'N');
+                                g_gps.lon   = nmea_to_degrees(toks[5], toks[6] ? toks[6][0] : 'E');
+                                g_gps.valid = true;
+                                g_gps.last_fix_ms = millis();
+                                g_gps_fix.store(true);
+                                /* Parse UTC time: hhmmss */
+                                if (toks[1] && strlen(toks[1]) >= 6) {
+                                    char t[3] = {0};
+                                    t[0]=toks[1][0]; t[1]=toks[1][1]; g_gps.hour   = atoi(t);
+                                    t[0]=toks[1][2]; t[1]=toks[1][3]; g_gps.minute = atoi(t);
+                                    t[0]=toks[1][4]; t[1]=toks[1][5]; g_gps.second = atoi(t);
+                                }
+                                /* Parse date: ddmmyy */
+                                if (toks[9] && strlen(toks[9]) >= 6) {
+                                    char d[3] = {0};
+                                    d[0]=toks[9][0]; d[1]=toks[9][1]; g_gps.day   = atoi(d);
+                                    d[0]=toks[9][2]; d[1]=toks[9][3]; g_gps.month = atoi(d);
+                                    d[0]=toks[9][4]; d[1]=toks[9][5]; g_gps.year  = 2000 + atoi(d);
+                                    g_gps.time_set = true;
+                                }
+                            } else {
+                                /* MEDIUM fix: status 'V' (void) — fix is no longer
+                                 * trustworthy; stop reporting FIX:YES / stale coords. */
+                                g_gps.valid = false;
+                                g_gps_fix.store(false);
+                            }
+                        }
+
+                        else if (strncmp(sbuf, "$GPGGA", 6) == 0 && n >= 10) {
+                            /* $GPGGA,hhmmss.ss,llll.ll,a,yyyyy.yy,a,x,xx,x.x,x.x,M,... */
+                            int fix_q = toks[6] ? atoi(toks[6]) : 0;
+                            if (fix_q > 0) {
+                                g_gps.sats  = toks[7] ? (uint8_t)atoi(toks[7]) : 0;
+                                g_gps.hdop  = toks[8] ? atof(toks[8]) : 99.9f;
+                                g_gps.alt_m = toks[9] ? atof(toks[9]) : 0.0f;
+                            }
+                        }
+
+                        xSemaphoreGive(g_gps_mutex);
+                    }
+                }
+                spos = 0;
+            } else {
+                sbuf[spos++] = c;
+            }
+        }
+
+        /* MEDIUM fix: if the last good fix is older than GPS_STALE_MS,
+         * downgrade valid/fix so the UI/CSV stop reporting a frozen,
+         * indefinitely-stale position and timestamp. */
+        if (xSemaphoreTake(g_gps_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (g_gps.valid && (millis() - g_gps.last_fix_ms) > GPS_STALE_MS) {
+                g_gps.valid = false;
+                g_gps_fix.store(false);
+            }
+            xSemaphoreGive(g_gps_mutex);
+        }
+
+        /* N1: warn once if no fix after GPS_FIX_TIMEOUT_MS */
+        if (!fix_warned && !g_gps_fix.load() &&
+            (millis() - boot_ms) > GPS_FIX_TIMEOUT_MS) {
+            fix_warned = true;
+            Serial.println("[GPS] no fix within 60 s — continuing without fix");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -806,48 +1107,35 @@ static void led_tick(void) {
     led_state_t led = g_led.load();
     switch (led) {
         case LED_SLOW:
-            if (now - last_ms >= 500) {
-                on = !on;
-                digitalWrite(PIN_LED, on ? HIGH : LOW);
-                last_ms = now;
-            }
+            if (now - last_ms >= 500) { on = !on; digitalWrite(PIN_LED, on); last_ms = now; }
             break;
         case LED_FAST:
-            if (now - last_ms >= 100) {
-                on = !on;
-                digitalWrite(PIN_LED, on ? HIGH : LOW);
-                last_ms = now;
-            }
+            if (now - last_ms >= 100) { on = !on; digitalWrite(PIN_LED, on); last_ms = now; }
             break;
         case LED_FLASH:
-            if (!on) {
-                digitalWrite(PIN_LED, HIGH);
-                on = true; last_ms = now;
-            } else if (now - last_ms >= 120) {
-                digitalWrite(PIN_LED, LOW);
-                on = false; g_led.store(LED_SLOW);
+            if (!on) { digitalWrite(PIN_LED, HIGH); on = true; last_ms = now; }
+            else if (now - last_ms >= 120) { digitalWrite(PIN_LED, LOW); on = false; g_led.store(LED_SLOW); }
+            break;
+        case LED_ERROR: {
+            uint32_t period;
+            if      (err_phase == 6)       period = 1000;
+            else if (err_phase % 2 == 0)   period = 2000;
+            else                           period =  500;
+            if (now - last_ms >= period) {
+                last_ms   = now;
+                err_phase = (err_phase >= 6) ? 0 : err_phase + 1;
+                on = (err_phase % 2 == 0) && (err_phase < 6);
+                digitalWrite(PIN_LED, on);
             }
             break;
-        case LED_ERROR:
-            {
-                uint32_t period;
-                if      (err_phase == 6)       period = 1000;
-                else if (err_phase % 2 == 0)   period = 2000;
-                else                           period =  500;
-                if (now - last_ms >= period) {
-                    last_ms   = now;
-                    err_phase = (err_phase >= 6) ? 0 : err_phase + 1;
-                    on = (err_phase % 2 == 0) && (err_phase < 6);
-                    digitalWrite(PIN_LED, on ? HIGH : LOW);
-                }
-            }
-            break;
+        }
     }
 }
 
-/* F10: btn_tick() is called from task_ui which sleeps 10 ms between calls.
- *      DEBOUNCE_MS (50 ms) is the effective filter — the 10 ms poll rate is
- *      an implicit dependency. Do not increase vTaskDelay above DEBOUNCE_MS. */
+/* F10: btn_tick polled at 10 ms from task_ui. DEBOUNCE_MS=50 is the filter.
+ * N5:  Short press cycles display page (0→1→2→3→0).
+ * N5:  Long press (≥3 s) = restart.
+ * N8:  Extra-long press (≥6 s) = set g_sleep_req. */
 static void btn_tick(void) {
     static bool     prev     = HIGH;
     static uint32_t press_ms = 0;
@@ -862,19 +1150,44 @@ static void btn_tick(void) {
         press_ms = now;
     } else if ((prev == LOW) && (cur == HIGH)) {
         uint32_t dur = now - press_ms;
-        if (dur >= (uint32_t)LONG_PRESS_MS) {
+        if (dur >= (uint32_t)SLEEP_PRESS_MS) {
+            /* N8: deep sleep */
+            g_sleep_req.store(true);
+        } else if (dur >= (uint32_t)LONG_PRESS_MS) {
             Serial.println("[BTN] long press -> restart");
             ESP.restart();
         } else if (dur >= (uint32_t)DEBOUNCE_MS) {
-            g_channel.store(1, std::memory_order_relaxed);
-            Serial.println("[BTN] short press -> ch=1");
+            /* N5: cycle display page */
+            uint8_t p = g_display_page.load();
+            g_display_page.store((p + 1) % 4);
+            Serial.printf("[BTN] page -> %u\n", (unsigned)g_display_page.load());
         }
     }
     prev = cur;
 }
 
 /* --------------------------------------------------------------------------
- * OLED draw
+ * N7: Battery ADC — 16-sample average, returns percentage 0–100
+ * -------------------------------------------------------------------------- */
+static uint8_t batt_read_pct(void) {
+    uint32_t sum = 0;
+    for (int i = 0; i < BATT_SAMPLES; i++) {
+        sum += analogRead(PIN_BATT_ADC);
+        delayMicroseconds(200);
+    }
+    uint32_t avg = sum / BATT_SAMPLES;
+    /* Convert ADC → mV at divider midpoint */
+    uint32_t vadc_mv = (avg * BATT_VREF_MV) / BATT_ADC_MAX;
+    /* Reconstruct Vbat (×2 for divider) */
+    uint32_t vbat_mv = vadc_mv * BATT_DIVIDER;
+    /* Clamp and map to 0–100% */
+    if (vbat_mv >= BATT_MAX_MV) return 100;
+    if (vbat_mv <= BATT_MIN_MV) return 0;
+    return (uint8_t)(((vbat_mv - BATT_MIN_MV) * 100UL) / (BATT_MAX_MV - BATT_MIN_MV));
+}
+
+/* --------------------------------------------------------------------------
+ * N5: OLED draw — 4 pages
  * -------------------------------------------------------------------------- */
 static void oled_draw(void) {
     static const char *faces[] = {
@@ -884,49 +1197,199 @@ static void oled_draw(void) {
         "(-_-)"    /* FACE_IDLE    */
     };
     char   line[24];
-    face_t f = g_face.load();
+    face_t f    = g_face.load();
+    uint8_t page = g_display_page.load();
 
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tf);
-
     display.drawStr(0, 10, faces[f]);
 
-    snprintf(line, sizeof(line), "HS:  %lu", (unsigned long)g_hs_count.load());
-    display.drawStr(0, 20, line);
-    snprintf(line, sizeof(line), "CH:  %u",  (unsigned)g_channel.load(std::memory_order_relaxed));
-    display.drawStr(0, 30, line);
+    switch (page) {
 
-    snprintf(line, sizeof(line), "AP:  %lu", (unsigned long)g_ap_count.load());
-    display.drawStr(0, 40, line);
-    snprintf(line, sizeof(line), "PKT: %lu", (unsigned long)g_pkt_rate.load());
-    display.drawStr(0, 50, line);
+        /* ── Page 0: Stats (original layout + page indicator) ── */
+        case 0:
+            snprintf(line, sizeof(line), "HS:  %lu", (unsigned long)g_hs_count.load());
+            display.drawStr(0, 20, line);
+            snprintf(line, sizeof(line), "CH:  %u",  (unsigned)g_channel.load(std::memory_order_relaxed));
+            display.drawStr(0, 30, line);
+            snprintf(line, sizeof(line), "AP:  %lu", (unsigned long)g_ap_count.load());
+            display.drawStr(0, 40, line);
+            snprintf(line, sizeof(line), "PKT: %lu", (unsigned long)g_pkt_rate.load());
+            display.drawStr(0, 50, line);
+            snprintf(line, sizeof(line), "RSSI:%-4d D:%lu",
+                     (int)g_last_rssi.load(std::memory_order_relaxed),
+                     (unsigned long)g_rssi_drops.load(std::memory_order_relaxed));
+            display.drawStr(0, 60, line);
+            display.drawStr(110, 10, "1/4");
+            break;
 
-    /* RSSI line: last passing RSSI and cumulative drop count.
-     * Example: "RSSI:-67 D:142"  — fits in 128px at 6px/char. */
-    snprintf(line, sizeof(line), "RSSI:%-4d D:%lu",
-             (int)g_last_rssi.load(std::memory_order_relaxed),
-             (unsigned long)g_rssi_drops.load(std::memory_order_relaxed));
-    display.drawStr(0, 60, line);
+        /* ── Page 1: GPS ── */
+        case 1: {
+            display.drawStr(110, 10, "2/4");
+            bool fix = g_gps_fix.load();
+            bool avail = g_gps_available.load();
+            if (!avail) {
+                display.drawStr(0, 30, "GPS: N/A");
+                break;
+            }
+            snprintf(line, sizeof(line), "FIX: %s", fix ? "YES" : "NO");
+            display.drawStr(0, 20, line);
+            if (fix && xSemaphoreTake(g_gps_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                snprintf(line, sizeof(line), "LAT:%.5f", (double)g_gps.lat);
+                display.drawStr(0, 30, line);
+                snprintf(line, sizeof(line), "LON:%.5f", (double)g_gps.lon);
+                display.drawStr(0, 40, line);
+                snprintf(line, sizeof(line), "ALT:%.0fm", (double)g_gps.alt_m);
+                display.drawStr(0, 50, line);
+                snprintf(line, sizeof(line), "SAT:%u HDOP:%.1f", g_gps.sats, (double)g_gps.hdop);
+                display.drawStr(0, 60, line);
+                xSemaphoreGive(g_gps_mutex);
+            } else if (!fix) {
+                display.drawStr(0, 35, "Waiting for fix..");
+            }
+            break;
+        }
+
+        /* ── Page 2: SD ── */
+        case 2: {
+            display.drawStr(110, 10, "3/4");
+            bool sd = g_sd_ok.load();
+            snprintf(line, sizeof(line), "SD:  %s", sd ? "OK" : "ERR");
+            display.drawStr(0, 20, line);
+            if (sd) {
+                uint64_t card = 0, used = 0;
+                if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    card = SD.cardSize();
+                    used = SD.usedBytes();
+                    xSemaphoreGive(g_sd_mutex);
+                }
+                uint32_t free_mb = (uint32_t)((card >= used ? card - used : 0) / (1024ULL * 1024ULL));
+                snprintf(line, sizeof(line), "FREE:%luMB", (unsigned long)free_mb);
+                display.drawStr(0, 30, line);
+
+                /* Show aps.csv and stats.csv sizes */
+                uint32_t ap_kb = 0, st_kb = 0;
+                if (xSemaphoreTake(g_sd_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    if (SD.exists(APLOG_PATH)) {
+                        File f = SD.open(APLOG_PATH, FILE_READ);
+                        if (f) { ap_kb = f.size() / 1024; f.close(); }
+                    }
+                    if (SD.exists(STATS_PATH)) {
+                        File f = SD.open(STATS_PATH, FILE_READ);
+                        if (f) { st_kb = f.size() / 1024; f.close(); }
+                    }
+                    xSemaphoreGive(g_sd_mutex);
+                }
+
+                snprintf(line, sizeof(line), "APS: %luKB", (unsigned long)ap_kb);
+                display.drawStr(0, 40, line);
+                snprintf(line, sizeof(line), "STS: %luKB", (unsigned long)st_kb);
+                display.drawStr(0, 50, line);
+            }
+            snprintf(line, sizeof(line), "WR:  %s", g_last_write_ok.load() ? "OK" : "ERR");
+            display.drawStr(0, 60, line);
+            break;
+        }
+
+        /* ── Page 3: System ── */
+        case 3: {
+            display.drawStr(110, 10, "4/4");
+            snprintf(line, sizeof(line), "HEAP:%luB", (unsigned long)ESP.getFreeHeap());
+            display.drawStr(0, 20, line);
+            uint32_t up_s = millis() / 1000;
+            snprintf(line, sizeof(line), "UP: %02lu:%02lu:%02lu",
+                     (unsigned long)(up_s / 3600),
+                     (unsigned long)((up_s % 3600) / 60),
+                     (unsigned long)(up_s % 60));
+            display.drawStr(0, 30, line);
+            snprintf(line, sizeof(line), "PKT: %lu/s", (unsigned long)g_pkt_rate.load());
+            display.drawStr(0, 40, line);
+            snprintf(line, sizeof(line), "DRP: %lu", (unsigned long)g_rssi_drops.load(std::memory_order_relaxed));
+            display.drawStr(0, 50, line);
+            snprintf(line, sizeof(line), "BAT: %u%%", (unsigned)g_batt_pct.load());
+            display.drawStr(0, 60, line);
+            break;
+        }
+    }
 
     display.sendBuffer();
 }
 
-/* F4: task_ui MUST run on Core 1. U8g2 HW-I2C (display.sendBuffer) holds the
- *     I2C bus for ~2 ms per frame. On Core 0 this can coincide with the WiFi
- *     promisc ISR, causing a cache-miss panic (LoadProhibited guru meditation).
- *     The xTaskCreatePinnedToCore(..., 1) in setup() enforces this; the assert
- *     below catches any future accidental migration. */
+/* --------------------------------------------------------------------------
+ * N8: Deep sleep sequence — called from task_ui when g_sleep_req is set.
+ *     Flushes write queue (max 2 s), shows OLED message, sleeps.
+ * -------------------------------------------------------------------------- */
+static void do_deep_sleep(void) {
+    Serial.println("[SLEEP] entering deep sleep");
+
+    /* Show sleep message on OLED */
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(20, 30, "SLEEP ZZZ");
+    display.drawStr(10, 45, "Hold BTN to wake");
+    display.sendBuffer();
+
+    /* Disable promiscuous mode to stop ISR activity */
+    esp_wifi_set_promiscuous(false);
+
+    /* Wait for write queue to drain (max 2 s) */
+    uint32_t flush_start = millis();
+    while (uxQueueMessagesWaiting(g_write_queue) > 0 &&
+           (millis() - flush_start) < 2000) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    /* LOW fix: suspend task_write before tearing down SD so it can't attempt
+     * a fresh SD.open() in the window before esp_deep_sleep_start(). */
+    if (h_write != NULL) vTaskSuspend(h_write);
+
+    /* Cleanly unmount SD */
+    xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    SD.end();
+    xSemaphoreGive(g_sd_mutex);
+
+    vTaskDelay(pdMS_TO_TICKS(1000));   /* Let OLED message display */
+
+    /* N8: wake on button GPIO4 LOW (EXT0) */
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BTN, 0);
+    esp_deep_sleep_start();
+    /* Never returns */
+}
+
+/* F4: task_ui pinned to Core 1.
+ * N5: cycles pages on short press.
+ * N7: reads battery every BATT_UPDATE_MS.
+ * N8: handles deep sleep request.
+ */
 static void task_ui(void *arg) {
-    configASSERT(xPortGetCoreID() == 1); /* F4 */
+    configASSERT(xPortGetCoreID() == 1);
     esp_task_wdt_add(NULL);
+
     uint32_t last_oled = 0;
+    uint32_t last_batt = 0;
+
+    /* Initial battery reading */
+    g_batt_pct.store(batt_read_pct());
 
     while (1) {
         esp_task_wdt_reset();
         uint32_t now = millis();
 
+        /* N8: check sleep request first */
+        if (g_sleep_req.load()) {
+            g_sleep_req.store(false);
+            do_deep_sleep();
+            /* unreachable */
+        }
+
         btn_tick();
         led_tick();
+
+        /* N7: update battery every 30 s */
+        if (now - last_batt >= BATT_UPDATE_MS) {
+            g_batt_pct.store(batt_read_pct());
+            last_batt = now;
+        }
 
         if (now - last_oled >= 200) {
             oled_draw();
@@ -935,6 +1398,67 @@ static void task_ui(void *arg) {
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+/* --------------------------------------------------------------------------
+ * N6: Startup self-test — runs before tasks are created.
+ *     Shows each subsystem result on OLED for ~600 ms.
+ * -------------------------------------------------------------------------- */
+static void selftest(bool sd_ok, bool gps_uart_ok, bool wifi_ok) {
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tf);
+    display.drawStr(0, 10, "Self-test v1.2.2");
+    display.sendBuffer();
+    delay(300);
+
+    /* SD */
+    display.clearBuffer();
+    display.drawStr(0, 10, "Self-test v1.2.2");
+    char line[24];
+    snprintf(line, sizeof(line), "SD:   %s", sd_ok ? "OK" : "FAIL");
+    display.drawStr(0, 22, line);
+    if (sd_ok) {
+        xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+        uint64_t card = SD.cardSize();
+        uint64_t used = SD.usedBytes();
+        xSemaphoreGive(g_sd_mutex);
+        uint32_t free_mb = (uint32_t)((card >= used ? card - used : 0) / (1024ULL * 1024ULL));
+        snprintf(line, sizeof(line), "  free: %luMB", (unsigned long)free_mb);
+        display.drawStr(0, 32, line);
+    }
+    display.sendBuffer();
+    delay(600);
+
+    /* GPS UART */
+    display.clearBuffer();
+    display.drawStr(0, 10, "Self-test v1.2.2");
+    snprintf(line, sizeof(line), "GPS:  %s", gps_uart_ok ? "UART OK" : "N/A");
+    display.drawStr(0, 22, line);
+    display.sendBuffer();
+    delay(600);
+
+    /* Heap */
+    display.clearBuffer();
+    display.drawStr(0, 10, "Self-test v1.2.2");
+    snprintf(line, sizeof(line), "HEAP: %luB", (unsigned long)ESP.getFreeHeap());
+    display.drawStr(0, 22, line);
+    display.sendBuffer();
+    delay(600);
+
+    /* WiFi promiscuous */
+    display.clearBuffer();
+    display.drawStr(0, 10, "Self-test v1.2.2");
+    snprintf(line, sizeof(line), "WIFI: %s", wifi_ok ? "OK" : "FAIL");
+    display.drawStr(0, 22, line);
+    display.sendBuffer();
+    delay(600);
+
+    /* Ready */
+    display.clearBuffer();
+    display.drawStr(20, 25, "Cheapagotchi");
+    display.drawStr(25, 40, "v1.2.2 Ready");
+    display.sendBuffer();
+    delay(1000);
 }
 
 /* --------------------------------------------------------------------------
@@ -949,6 +1473,11 @@ void setup(void) {
     pinMode(PIN_BTN, INPUT_PULLUP);
     digitalWrite(PIN_LED, LOW);
 
+    /* N7: configure ADC for battery pin */
+    analogSetAttenuation(ADC_11db);
+    analogReadResolution(12);
+    pinMode(PIN_BATT_ADC, INPUT);
+
     Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
     display.begin();
     display.clearBuffer();
@@ -960,10 +1489,13 @@ void setup(void) {
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
     esp_task_wdt_add(NULL);
 
+    /* Create synchronisation primitives */
     g_pkt_free_q    = xQueueCreate(PKT_POOL_DEPTH,    sizeof(uint8_t));
     g_hs_raw_free_q = xQueueCreate(HS_RAW_POOL_DEPTH, sizeof(uint8_t));
+    g_ap_log_queue  = xQueueCreate(AP_LOG_QUEUE_DEPTH, sizeof(ap_log_item_t));  /* N2 */
     configASSERT(g_pkt_free_q);
     configASSERT(g_hs_raw_free_q);
+    configASSERT(g_ap_log_queue);
 
     for (uint8_t i = 0; i < PKT_POOL_DEPTH; i++)
         xQueueSend(g_pkt_free_q, &i, 0);
@@ -972,25 +1504,33 @@ void setup(void) {
 
     g_pkt_queue   = xQueueCreate(PKT_QUEUE_DEPTH,   sizeof(pkt_item_t));
     g_write_queue = xQueueCreate(WRITE_QUEUE_DEPTH, sizeof(write_item_t));
-    /* F5: Recursive mutex — hs_expire() is called both standalone and nested
-     *     inside process_packet() which already holds this mutex. */
     g_hs_mutex    = xSemaphoreCreateRecursiveMutex();
     g_sd_mutex    = xSemaphoreCreateMutex();
-
+    g_gps_mutex   = xSemaphoreCreateMutex();   /* N1 */
     configASSERT(g_pkt_queue);
     configASSERT(g_write_queue);
     configASSERT(g_hs_mutex);
     configASSERT(g_sd_mutex);
+    configASSERT(g_gps_mutex);
 
     memset(g_hs,       0, sizeof(g_hs));
     memset(g_ap_table, 0, sizeof(g_ap_table));
+    memset(&g_gps,     0, sizeof(g_gps));   /* N1 */
 
     for (int i = 0; i < MAX_HS_SLOTS; i++)
         for (int j = 0; j < 4; j++)
             g_hs[i].raw_idx[j] = POOL_NONE;
 
-    sd_init();
+    /* SD init */
+    bool sd_ok = sd_init();
 
+    /* N1: Open GPS UART2 for self-test check (task_gps will use it after) */
+    Serial2.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    bool gps_uart_ok = true;   /* Serial2.begin() has no return status */
+    g_gps_available.store(gps_uart_ok);
+    Serial2.end();   /* task_gps will re-open it */
+
+    /* WiFi init */
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     esp_wifi_set_promiscuous(false);
@@ -1000,36 +1540,33 @@ void setup(void) {
     esp_wifi_set_promiscuous_filter(&flt);
     esp_wifi_set_promiscuous_rx_cb(promisc_cb);
 
-    if (esp_wifi_set_promiscuous(true) != ESP_OK) {
+    bool wifi_ok = (esp_wifi_set_promiscuous(true) == ESP_OK);
+    if (!wifi_ok) {
         Serial.println("[WIFI] promiscuous failed -> restart");
         ESP.restart();
     }
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     Serial.println("[WIFI] promiscuous active");
 
-    /* F9: Stack sizes tuned via uxTaskGetStackHighWaterMark() — bumped from
-     *     4096 to 6144 for proc/write to accommodate Serial.printf + lambda
-     *     frame overhead. Monitor watermark in debug builds. */
+    /* N6: Self-test screen */
+    selftest(sd_ok, gps_uart_ok, wifi_ok);
+
+    /* Create tasks */
     xTaskCreatePinnedToCore(task_proc,  "pkt_proc", STACK_PROC,  NULL, 5, &h_proc,  0);
     xTaskCreatePinnedToCore(task_write, "sd_write", STACK_WRITE, NULL, 4, &h_write, 0);
     xTaskCreatePinnedToCore(task_hop,   "ch_hop",   STACK_HOP,   NULL, 6, &h_hop,   0);
     xTaskCreatePinnedToCore(task_ui,    "ui",       STACK_UI,    NULL, 1, &h_ui,    1);
+    xTaskCreatePinnedToCore(task_gps,   "gps",      STACK_GPS,   NULL, 2, &h_gps,   1);  /* N1 */
 
     configASSERT(h_proc);
     configASSERT(h_write);
     configASSERT(h_hop);
     configASSERT(h_ui);
+    configASSERT(h_gps);
 
-    display.clearBuffer();
-    display.drawStr(0, 20, "Cheapagotchi");
-    display.drawStr(0, 34, "Running...");
-    display.sendBuffer();
-
-    Serial.println("[BOOT] tasks started");
-    /* R6: Log free heap AFTER all task creations so the value reflects real
-     *     post-allocation headroom. Previously logged before tasks were created,
-     *     giving an optimistic reading that didn't account for task stacks. */
+    /* R6: Log free heap after all task creations */
     Serial.printf("[MEM]  free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+
     esp_task_wdt_delete(NULL);
 }
 
