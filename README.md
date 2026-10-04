@@ -4,7 +4,6 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Build](https://img.shields.io/badge/Build-Arduino_IDE_2.x-orange)](https://www.arduino.cc/)
 [![Author](https://img.shields.io/badge/Author-tworjaga-lightgrey)](https://github.com/tworjaga)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tworjaga/ESP32Gotchi)
 <img src="https://visitor-badge.laobi.icu/badge?page_id=tworjaga.ESP32Gotchi&"  />
 
 > Autonomous WPA/WPA2 handshake capture and Wi-Fi AP monitoring device based on ESP32.  
@@ -12,7 +11,7 @@
 
 ---
 
-## Overview
+## Overview [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tworjaga/ESP32Gotchi)
 
 ESP32Gotchi is a self-contained passive Wi-Fi handshake sniffer and AP logger inspired by the Pwnagotchi project. It runs on an ~10–15 EUR hardware stack, requires no host computer, and writes standard PCAP files and CSV logs directly to a microSD card. All operation is autonomous from power-on.
 
