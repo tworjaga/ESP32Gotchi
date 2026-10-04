@@ -19,6 +19,10 @@ The firmware uses FreeRTOS with five independent tasks, a promiscuous-mode Wi-Fi
 
 ---
 
+![ESP32Gotchi diagram](https://tworjaga.github.io/assets/diagram1.png)
+
+---
+
 ## Hardware
 
 ### Bill of Materials
