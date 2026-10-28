@@ -136,11 +136,11 @@ All packet storage is statically allocated at boot. No `malloc()` or `free()` at
 
 | Region | Size | Purpose |
 |--------|------|---------|
-| `pkt_pool_mem[32][1600]` | 51 200 B | In-flight packet buffers (claimed by `promisc_cb`, released by `task_proc`) |
-| `hs_raw_pool_mem[32][1600]` | 51 200 B | Handshake frame storage (held until PCAP written, then released) |
+| `pkt_pool_mem[20][1600]` | 32 000 B | In-flight packet buffers (claimed by `promisc_cb`, released by `task_proc`) |
+| `hs_raw_pool_mem[20][1600]` | 32 000 B | Handshake frame storage (held until PCAP written, then released) |
 | `g_hs[16]` metadata | ~640 B | Handshake slot state (indices into `hs_raw_pool_mem`, not frame data) |
 | `g_ap_table[256][6]` | 1 536 B | AP hash table |
-| **Total user static** | **~104 KB** | Well within the ~200 KB available after the Wi-Fi stack |
+| **Total user static** | **~66 KB** | Pool depth is 20 (not 32) so the whole image's static RAM (~34%) fits the ESP32 internal DRAM segment — see the note in `config.h` |
 
 ### EAPOL Detection
 
@@ -337,7 +337,7 @@ An extra-long button press (≥ 6 seconds) triggers a clean shutdown sequence:
    Upload speed     : 921600
    ```
 
-4. Open `Cheapagotchi.ino`, compile, and flash.
+4. Open the sketch folder `Cheapagotchi/` (open `Cheapagotchi/Cheapagotchi.ino`); the IDE loads all module tabs automatically. Compile and flash.
 
 ### PlatformIO
 
@@ -390,13 +390,25 @@ Connect at 115200 baud. Example output:
 
 ```
 ESP32Gotchi/
- |-- Cheapagotchi.ino        # Full firmware source
+ |-- Cheapagotchi/              # Arduino sketch folder (multi-file)
+ |    |-- Cheapagotchi.ino      # setup()/loop(), WiFi + task bring-up
+ |    |-- config.h              # pins, tuning constants, FW_VERSION
+ |    |-- types.h               # shared structs & enums
+ |    |-- util.h                # byte + MAC helpers (header-only)
+ |    |-- state.h / state.cpp   # shared-state core + LOCK ORDERING contract
+ |    |-- ap_table.h / .cpp     # unique-AP hash table (F2)
+ |    |-- gps.h / .cpp          # NMEA parsing, GPS time/epoch
+ |    |-- sdlog.h / .cpp        # SD mount, CSV logging, SD writer task
+ |    |-- pcap.h / .cpp         # PCAP handshake writer
+ |    |-- handshake.h / .cpp    # 802.11/EAPOL parsing, slot lifecycle
+ |    |-- capture.h / .cpp      # promiscuous callback, proc/hop tasks
+ |    └── ui.h / .cpp           # OLED/LED/button, self-test, deep sleep
  |-- README.md
  |-- LICENSE
  |-- hardware/
- |    └── BOM.md             # Bill of materials
+ |    └── BOM.md                # Bill of materials
  └── docs/
-      └── pcap_analysis.md   # Notes on opening captures in Wireshark
+      └── pcap_analysis.md      # Notes on opening captures in Wireshark
 ```
 
 ---
@@ -427,8 +439,8 @@ ESP32Gotchi/
 | Channels scanned | 1 – 11 |
 | Channel dwell time | 200 ms |
 | Packet queue depth | 32 items |
-| Packet pool blocks | 32 × 1 600 B (static) |
-| HS raw-frame pool blocks | 32 × 1 600 B (static) |
+| Packet pool blocks | 20 × 1 600 B (static) |
+| HS raw-frame pool blocks | 20 × 1 600 B (static) |
 | Max concurrent handshake slots | 16 |
 | Max tracked APs | 192 (hash table, 256 buckets) |
 | Handshake slot timeout | 15 s |
