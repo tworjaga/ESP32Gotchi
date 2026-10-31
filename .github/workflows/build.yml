@@ -1,10 +1,5 @@
 name: build
 
-# Builds the ESP32Gotchi firmware and publishes flashable binaries.
-# Artifacts (and, on a v* tag, a GitHub Release) contain everything an
-# esptool-js web flasher needs: a single merged image to flash at 0x0, plus the
-# individual bootloader / partitions / boot_app0 / app parts with their offsets.
-
 on:
   push:
     branches: [main]
@@ -13,7 +8,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Pin the toolchain to what the firmware was developed and verified against.
 env:
   ESP32_CORE_VERSION: 2.0.17
   U8G2_VERSION: 2.36.19
@@ -101,6 +95,9 @@ jobs:
             0x10000  firmware.bin
           EOF
 
+          # Checksums for the download page and manual verification.
+          ( cd dist && sha256sum firmware-merged.bin bootloader.bin partitions.bin boot_app0.bin firmware.bin > SHA256SUMS )
+
           {
             echo "### ESP32Gotchi firmware ${VERSION}"
             echo '| File | Flash offset |'
@@ -118,6 +115,16 @@ jobs:
           name: esp32gotchi-firmware
           path: dist/
           if-no-files-found: error
+
+      - name: Publish to R2 (esp32gotchi/latest)
+        if: github.event_name != 'pull_request'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 sync dist/ "s3://${{ secrets.R2_BUCKET }}/esp32gotchi/latest/" \
+            --endpoint-url "${{ secrets.R2_ENDPOINT }}" --no-progress --delete
 
       - name: Attach binaries to release
         if: startsWith(github.ref, 'refs/tags/v')
